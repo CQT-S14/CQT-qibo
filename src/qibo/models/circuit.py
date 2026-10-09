@@ -1263,6 +1263,11 @@ class Circuit:
             else:
                 name = qasm_label
             code.append(f"{name} {qubits};")
+            if isinstance(gate, gates.CU3):
+                # qibo's U3 differs from OpenQASM's u3 by a phase exp(-i (phi + lam) / 2),
+                # which becomes a phase on the control qubit once the gate is controlled
+                _, phi, lam = (float(x) for x in gate.parameters)
+                code.append(f"u1({-(phi + lam) / 2}) q[{gate.control_qubits[0]}];")
 
         if extended_compatibility:
             code = code[:4] + gate_definitions + code[4:]

@@ -172,13 +172,27 @@ rx(0.1) q[0];
 rz(0.4) q[1];
 u2(0.5, 0.6) q[2];
 cu1(0.7) q[0],q[1];
-cu3(0.2, 0.3, 0.4) q[2],q[1];"""
+cu3(0.2, 0.3, 0.4) q[2],q[1];
+u1({-(0.3 + 0.4) / 2}) q[2];"""
     assert_strings_equal(circuit.to_qasm(), target)
 
     circuit = Circuit(2)
     circuit.add(gates.CU2(0, 1, 0.1, 0.2))
     with pytest.raises(NotImplementedError):
         target = circuit.to_qasm()
+
+
+@pytest.mark.parametrize("qubits", [(0, 1), (1, 0)])
+def test_cu3_matches_qelib1(backend, qubits):
+    """qelib1's ``cu3`` controls OpenQASM's ``u3``, which differs from qibo's
+    ``U3`` by a phase that matters once the gate is controlled."""
+    qiskit_qasm2 = pytest.importorskip("qiskit.qasm2")
+    from qiskit.quantum_info import Operator
+
+    circuit = Circuit(2)
+    circuit.add(gates.CU3(*qubits, 0.2, 0.3, 0.4))
+    target = Operator(qiskit_qasm2.loads(circuit.to_qasm())).reverse_qargs().data
+    backend.assert_allclose(circuit.unitary(backend), target, atol=1e-10)
 
 
 def test_crotations():
