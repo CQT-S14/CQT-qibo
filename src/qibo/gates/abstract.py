@@ -275,6 +275,13 @@ class Gate:
             measurements,
         )
 
+        if raw["_class"] == "Condition":
+            raise_error(
+                ValueError,
+                "A ``Condition`` refers to a measurement of its circuit, "
+                + "so it can only be loaded with ``Circuit.from_dict``.",
+            )
+
         for mod in (gates, measurements):
             try:
                 cls = getattr(mod, raw["_class"])

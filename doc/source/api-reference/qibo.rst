@@ -737,6 +737,13 @@ Measurement (M)
     :members:
     :member-order: bysource
 
+Conditional operations (Condition)
+""""""""""""""""""""""""""""""""""""
+
+.. autoclass:: qibo.gates.Condition
+    :members:
+    :member-order: bysource
+
 Rotation X-axis (RX)
 """"""""""""""""""""
 

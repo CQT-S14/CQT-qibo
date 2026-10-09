@@ -1,22 +1,42 @@
+"""Conditional operations on mid-circuit measurements, exported to OpenQASM 3.
+
+Simulation of ``gates.Condition`` is not supported yet, so the circuit is
+converted to OpenQASM 3 and, if Qiskit is installed, executed with Qiskit Aer.
+"""
+
 from qibo import Circuit, gates
-from qibo.measurements import MeasurementResult
-import qiskit.qasm2
 
-
-# Build the circuit
-circuit = Circuit(1, density_matrix=True)
-# Add some gates
+circuit = Circuit(3)
 circuit.add(gates.H(0))
-output, register_name = circuit.add(gates.M(0, collapse=True))
-circuit.add(gates.Condition(register_name, 1, gates.X(0)))
-circuit.add(gates.H(0))
+circuit.add(gates.H(1))
 
-circuit.add(gates.M(0))
+# mid-circuit measurement of qubit 0, its outcome is ``bit.symbols[0]``
+bit = circuit.add(gates.M(0, collapse=True))
+# active reset: flip qubit 0 back to |0> if it was measured in |1>
+circuit.add(gates.Condition(bit.symbols[0], 1, gates.X(0)))
+# feed-forward on another qubit
+circuit.add(gates.Condition(bit.symbols[0], 0, gates.H(2)))
 
+# condition on the outcome of a two-qubit measurement: register values use
+# qibo's bit order, where ``register.symbols[0]`` is the most significant bit
+register = circuit.add(gates.M(0, 1, collapse=True))
+circuit.add(gates.Condition(register, "01", gates.X(2)))
+circuit.add(gates.M(0, 1, 2, register_name="result"))
+
+circuit.draw()
+print()
 print(circuit.to_qasm3())
+print()
+# the same program reusing the registers of measurements no longer needed
+print(circuit.to_qasm3(reuse_registers=True))
 
-# Execute the circuit and obtain the final state
-result = circuit(nshots=100) # circuit.execute(initial_state) also works
-
-print(circuit.to_qasm())
-
+try:
+    import qiskit.qasm3
+    from qiskit_aer import AerSimulator
+except ImportError:
+    print("\nInstall qiskit, qiskit-qasm3-import and qiskit-aer to run the circuit.")
+else:
+    qiskit_circuit = qiskit.qasm3.loads(circuit.to_qasm3())
+    counts = AerSimulator().run(qiskit_circuit, shots=1000).result().get_counts()
+    print("\nQiskit Aer counts (registers printed last-declared first):")
+    print(counts)

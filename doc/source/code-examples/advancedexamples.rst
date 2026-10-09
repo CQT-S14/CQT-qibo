@@ -507,6 +507,43 @@ If more than one qubits are used in a ``collapse=True`` measurement gate the
     circuit.add(gates.RY(2, theta=np.pi * (output.symbols[0] + output.symbols[1]) / 5))
     result = circuit()
 
+Applying gates conditionally on measurement outcomes
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Measurement outcomes can also decide whether a gate is applied at all, using
+:class:`qibo.gates.Condition`. The condition refers to a measured bit through
+``output.symbols`` or to the whole register through ``output``. Register
+outcomes are integers or bitstrings where ``output.symbols[0]`` is the most
+significant bit:
+
+.. testcode::
+
+    from qibo import Circuit, gates
+
+    circuit = Circuit(3)
+    circuit.add(gates.H(0))
+    circuit.add(gates.H(1))
+    output = circuit.add(gates.M(0, 1, collapse=True))
+    # flip qubit 2 if qubit 0 was measured in state 1
+    circuit.add(gates.Condition(output.symbols[0], 1, gates.X(2)))
+    # apply Z to qubit 2 if qubit 0 was measured in 1 and qubit 1 in 0
+    circuit.add(gates.Condition(output, "10", gates.Z(2)))
+
+Simulation of conditional gates is not supported yet, but circuits containing
+them can be converted to OpenQASM 3 with
+:meth:`qibo.models.circuit.Circuit.to_qasm3`, for instance to execute them
+with Qiskit:
+
+.. code-block:: python
+
+    import qiskit.qasm3
+
+    qasm = circuit.to_qasm3()
+    qiskit_circuit = qiskit.qasm3.loads(qasm)
+
+Programs with many mid-circuit measurements can reuse the classical registers
+whose outcomes are no longer needed with ``circuit.to_qasm3(reuse_registers=True)``.
+
 
 How to invert a circuit?
 ------------------------

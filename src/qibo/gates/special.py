@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 from qibo.backends import _check_backend
 from qibo.gates.abstract import SpecialGate
+from qibo.gates.condition import Condition
 from qibo.gates.measurements import M
 
 if TYPE_CHECKING:
@@ -54,7 +55,7 @@ class FusedGate(SpecialGate):
     def from_gate(cls, gate):
         fgate = cls(*gate.qubits)
         fgate.append(gate)
-        if isinstance(gate, (M, SpecialGate)):
+        if isinstance(gate, (M, SpecialGate, Condition)):
             # special gates do not participate in fusion
             fgate.marked = True
         return fgate
