@@ -99,11 +99,17 @@ class QASM3Exporter:
         reuse_registers (bool): if ``True``, a mid-circuit measurement writes
             into the register of an earlier one of the same size whose value is
             no longer needed, instead of declaring a new register.
+        switch_statement (bool): if ``True``, conditions testing several values
+            are written as ``switch`` statements, otherwise as chains of
+            ``if``/``else if``/``else`` statements.
     """
 
-    def __init__(self, circuit, reuse_registers: bool = False):
+    def __init__(
+        self, circuit, reuse_registers: bool = False, switch_statement: bool = False
+    ):
         self.circuit = circuit
         self.reuse_registers = reuse_registers
+        self.switch_statement = switch_statement
         self.queue = list(circuit.queue)
         # custom gate definitions used by the program
         self.definitions = []
@@ -279,6 +285,8 @@ class QASM3Exporter:
         register = self.registers[source]
         if condition.bit is not None:
             register = f"{register}[{condition.bit}]"
+        if self.switch_statement and sum(map(len, (v for v, _ in condition.cases))) > 1:
+            return self._switch(condition, register, position, depth)
 
         def test(value):
             if condition.bit is not None:
@@ -298,6 +306,24 @@ class QASM3Exporter:
         if condition.default is not None:
             lines.append(f"{indent}}} else {{")
             lines.extend(self._block(condition.default, position, depth))
+        lines.append(f"{indent}}}")
+        return lines
+
+    def _switch(self, condition, register: str, position: int, depth: int) -> list[str]:
+        """Statements of a condition written as a ``switch`` statement."""
+        indent = "  " * depth
+        lines = [f"{indent}switch (int({register})) {{"]
+        for values, body in condition.cases:
+            labels = ", ".join(
+                str(_qasm_integer(value, condition.nbits)) for value in values
+            )
+            lines.append(f"{indent}  case {labels} {{")
+            lines.extend(self._block(body, position, depth + 1))
+            lines.append(f"{indent}  }}")
+        if condition.default is not None:
+            lines.append(f"{indent}  default {{")
+            lines.extend(self._block(condition.default, position, depth + 1))
+            lines.append(f"{indent}  }}")
         lines.append(f"{indent}}}")
         return lines
 

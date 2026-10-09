@@ -14,21 +14,29 @@ circuit.add(gates.H(1))
 bit = circuit.add(gates.M(0, collapse=True))
 # active reset: flip qubit 0 back to |0> if it was measured in |1>
 circuit.add(gates.Condition(bit.symbols[0], 1, gates.X(0)))
-# feed-forward on another qubit
-circuit.add(gates.Condition(bit.symbols[0], 0, gates.H(2)))
+# if/else with several gates per branch
+circuit.add(
+    gates.Condition(bit.symbols[0], 0, [gates.H(2), gates.S(2)], default=gates.X(2))
+)
 
-# condition on the outcome of a two-qubit measurement: register values use
+# switch on the outcome of a two-qubit measurement: register values use
 # qibo's bit order, where ``register.symbols[0]`` is the most significant bit
 register = circuit.add(gates.M(0, 1, collapse=True))
-circuit.add(gates.Condition(register, "01", gates.X(2)))
+circuit.add(
+    gates.Condition(
+        register,
+        {0: gates.Z(2), (1, "10"): [gates.H(2), gates.T(2)]},
+        default=gates.Y(2),
+    )
+)
 circuit.add(gates.M(0, 1, 2, register_name="result"))
 
 circuit.draw()
 print()
 print(circuit.to_qasm3())
 print()
-# the same program reusing the registers of measurements no longer needed
-print(circuit.to_qasm3(reuse_registers=True))
+# the same program with a ``switch`` statement and reused registers
+print(circuit.to_qasm3(switch_statement=True, reuse_registers=True))
 
 try:
     import qiskit.qasm3

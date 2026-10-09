@@ -12,7 +12,7 @@ __all__ = ["Condition"]
 
 
 class Condition(Gate):
-    """Applies a gate only if a mid-circuit measurement has a given outcome.
+    """Applies gates only if a mid-circuit measurement has a given outcome.
 
     The outcome is referenced through the objects returned when a measurement
     is added to a circuit, in the same way as measurement symbols are used to
@@ -28,6 +28,21 @@ class Condition(Gate):
     ``result = circuit.add(gates.M(0, 1, collapse=True))`` the value ``2``
     (or ``"10"``) means that the first measured bit is ``1`` and the second is ``0``.
 
+    A condition can test a single value (``if``), or several values each with
+    its own gates, like a ``switch`` statement:
+
+    - ``Condition(source, value, body)`` applies ``body`` if the outcome is ``value``;
+    - ``Condition(source, {value: body, ...})`` applies the body of the matching value;
+    - ``Condition(source, [value, ...], [body, ...])`` is equivalent, with the values
+      and bodies given as two sequences of the same length.
+
+    A value can also be a tuple of values that share the same body, as in
+    ``{(1, 2): body}``. If ``default`` is given, it is applied when no value
+    matches (``else``). A body is a gate, a list of gates, a generator of
+    gates such as :meth:`qibo.models.circuit.Circuit.on_qubits`, or a
+    :class:`qibo.models.circuit.Circuit`, whose gates are used. Bodies may contain
+    other conditions, but not measurements.
+
     Simulation of conditional gates is not supported yet. Circuits containing
     them can be exported with :meth:`qibo.models.circuit.Circuit.to_qasm3`.
 
@@ -36,27 +51,92 @@ class Condition(Gate):
 
             from qibo import Circuit, gates
 
-            circuit = Circuit(2)
+            circuit = Circuit(3)
             circuit.add(gates.H(0))
-            result = circuit.add(gates.M(0, collapse=True))
-            # flip qubit 1 if qubit 0 was measured in state 1
-            circuit.add(gates.Condition(result.symbols[0], 1, gates.X(1)))
-            circuit.add(gates.M(0, 1))
+            circuit.add(gates.H(1))
+            bit = circuit.add(gates.M(0, collapse=True))
+            # flip qubit 2 if qubit 0 was measured in state 1
+            circuit.add(gates.Condition(bit.symbols[0], 1, gates.X(2)))
+            # if/else with several gates in each branch
+            circuit.add(
+                gates.Condition(
+                    bit.symbols[0], 0, [gates.H(2), gates.S(2)], default=gates.Z(2)
+                )
+            )
+            # switch on the outcome of a two-qubit measurement
+            register = circuit.add(gates.M(0, 1, collapse=True))
+            circuit.add(
+                gates.Condition(
+                    register,
+                    {0: gates.X(2), (1, 2): [gates.H(2), gates.T(2)]},
+                    default=gates.Y(2),
+                )
+            )
+            circuit.add(gates.M(2))
             print(circuit.to_qasm3())
 
     Args:
         source (:class:`qibo.measurements.MeasurementSymbol` or :class:`qibo.measurements.MeasurementResult`):
             measured bit or register that the condition depends on.
-        value (int or str): outcome for which ``gate`` is applied. For a single
-            bit, ``0`` or ``1`` (``False`` or ``True``). For a register, an integer
-            in :math:`[0, 2^{n})` or a bitstring of length :math:`n`.
-        gate (:class:`qibo.gates.Gate`): gate applied when the condition holds.
+        value (int or str or tuple or dict or list): outcome for which ``body``
+            is applied. For a single bit, ``0`` or ``1`` (``False`` or ``True``).
+            For a register, an integer in :math:`[0, 2^{n})` or a bitstring of
+            length :math:`n`. A dictionary maps values to bodies, and a list or
+            tuple gives one value per entry of ``body``.
+        body (:class:`qibo.gates.Gate` or list or :class:`qibo.models.circuit.Circuit`, optional):
+            gates applied when the outcome is ``value``. When ``value`` is a list
+            or tuple, a list with one body per value. Not used when ``value`` is a
+            dictionary.
+        default (:class:`qibo.gates.Gate` or list or :class:`qibo.models.circuit.Circuit`, optional):
+            gates applied when the outcome matches no value. Defaults to ``None``.
     """
 
-    def __init__(self, source, value, gate):
+    def __init__(self, source, value, body=None, default=None):
         super().__init__()
         self._set_source(source)
-        self._setup([((self._parse_value(value),), [gate])], None)
+        if isinstance(value, dict):
+            if body is not None:
+                raise_error(
+                    ValueError,
+                    "``body`` cannot be given when the cases are a dictionary.",
+                )
+            pairs = list(value.items())
+        elif isinstance(value, (list, tuple, range)):
+            if not isinstance(body, (list, tuple)) or len(body) != len(value):
+                raise_error(
+                    ValueError,
+                    "When several values are given, ``body`` must be a list "
+                    + "or tuple with one body per value.",
+                )
+            pairs = list(zip(value, body))
+        else:
+            if body is None:
+                raise_error(ValueError, "Missing the ``body`` of the condition.")
+            pairs = [(value, body)]
+        if not pairs:
+            raise_error(ValueError, "A ``Condition`` needs at least one value.")
+
+        cases = [(self._parse_values(values), _body(body)) for values, body in pairs]
+        seen = set()
+        for values, _ in cases:
+            for outcome in values:
+                if outcome in seen:
+                    raise_error(
+                        ValueError,
+                        f"Value {outcome} is used by more than one case of the condition.",
+                    )
+                seen.add(outcome)
+        self._setup(cases, None if default is None else _body(default))
+
+    def _parse_values(self, values) -> tuple[int, ...]:
+        """Values of a case, as a tuple of integers in qibo's bit ordering."""
+        if isinstance(values, (list, tuple, set, frozenset)):
+            if not values:
+                raise_error(
+                    ValueError, "A case of a condition needs at least one value."
+                )
+            return tuple(self._parse_value(value) for value in values)
+        return (self._parse_value(values),)
 
     @classmethod
     def _from_cases(cls, source, cases, default):
@@ -79,7 +159,7 @@ class Condition(Gate):
 
     def _setup(self, cases, default):
         self.name = "condition"
-        self.draw_label = "if"
+        self.draw_label = "if" if len(cases) == 1 else "switch"
         self.cases = cases
         self.default = default
         for gate in self.gates:
@@ -310,6 +390,24 @@ class Condition(Gate):
 
     def apply_hamming_weight(self, backend, state, nqubits, weight):
         return self.apply(backend, state, nqubits)
+
+
+def _body(body) -> list:
+    """List of gates of a conditional branch.
+
+    Accepts a gate, a circuit, or (nested) iterables of gates and circuits.
+    """
+    from qibo.models.circuit import Circuit
+
+    if isinstance(body, Gate):
+        return [body]
+    if isinstance(body, Circuit):
+        return list(body.queue)
+    if isinstance(body, (str, bytes)) or not hasattr(body, "__iter__"):
+        raise_error(
+            TypeError, f"Conditional operations must be gates, not {type(body)}."
+        )
+    return [gate for item in body for gate in _body(item)]
 
 
 def _find_measurement(measurements: list, result: MeasurementResult) -> int | None:

@@ -1274,7 +1274,9 @@ class Circuit:
 
         return "\n".join(code)
 
-    def to_qasm3(self, reuse_registers: bool = False) -> str:
+    def to_qasm3(
+        self, reuse_registers: bool = False, switch_statement: bool = False
+    ) -> str:
         """Convert circuit to an OpenQASM 3 string.
 
         Besides the gates supported by :meth:`qibo.models.circuit.Circuit.to_qasm`,
@@ -1293,6 +1295,11 @@ class Circuit:
                 writes into the register of an earlier mid-circuit measurement of
                 the same size whose outcome is not used by any later condition,
                 instead of declaring a new register. Defaults to ``False``.
+            switch_statement (bool, optional): if ``True``, conditions with several
+                values are written as OpenQASM 3 ``switch`` statements. Otherwise
+                they are written as ``if``/``else if``/``else`` chains, which,
+                unlike ``switch``, can be read by Qiskit's OpenQASM 3 importer.
+                Defaults to ``False``.
 
         Returns:
             str: The generated OpenQASM 3 program.
@@ -1304,7 +1311,9 @@ class Circuit:
         """
         from qibo.models._qasm3 import QASM3Exporter
 
-        return QASM3Exporter(self, reuse_registers=reuse_registers).dumps()
+        return QASM3Exporter(
+            self, reuse_registers=reuse_registers, switch_statement=switch_statement
+        ).dumps()
 
     def to_qasm_file(
         self, qasm_file: str, extended_compatibility: bool = False

@@ -510,11 +510,10 @@ If more than one qubits are used in a ``collapse=True`` measurement gate the
 Applying gates conditionally on measurement outcomes
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Measurement outcomes can also decide whether a gate is applied at all, using
+Measurement outcomes can also decide whether gates are applied at all, using
 :class:`qibo.gates.Condition`. The condition refers to a measured bit through
-``output.symbols`` or to the whole register through ``output``. Register
-outcomes are integers or bitstrings where ``output.symbols[0]`` is the most
-significant bit:
+``output.symbols`` or to the whole register through ``output``, and holds a
+gate, a list of gates or a circuit:
 
 .. testcode::
 
@@ -522,12 +521,33 @@ significant bit:
 
     circuit = Circuit(3)
     circuit.add(gates.H(0))
-    circuit.add(gates.H(1))
+    output = circuit.add(gates.M(0, collapse=True))
+    # flip qubit 1 if qubit 0 was measured in state 1
+    circuit.add(gates.Condition(output.symbols[0], 1, gates.X(1)))
+    # otherwise, apply H and T to qubit 2
+    circuit.add(gates.Condition(output.symbols[0], 0, [gates.H(2), gates.T(2)]))
+    circuit.add(gates.M(0, 1, 2))
+
+A ``default`` branch is applied when the outcome does not match (``else``),
+and several outcomes, each with its own gates, can be tested at once, like a
+``switch`` statement. Register outcomes are integers or bitstrings where
+``output.symbols[0]`` is the most significant bit:
+
+.. testcode::
+
+    from qibo import Circuit, gates
+
+    circuit = Circuit(3)
+    circuit.add([gates.H(0), gates.H(1)])
     output = circuit.add(gates.M(0, 1, collapse=True))
-    # flip qubit 2 if qubit 0 was measured in state 1
-    circuit.add(gates.Condition(output.symbols[0], 1, gates.X(2)))
-    # apply Z to qubit 2 if qubit 0 was measured in 1 and qubit 1 in 0
-    circuit.add(gates.Condition(output, "10", gates.Z(2)))
+    circuit.add(gates.Condition(output.symbols[1], 1, gates.Z(2), default=gates.X(2)))
+    circuit.add(
+        gates.Condition(
+            output,
+            {0: gates.X(2), (1, "10"): [gates.H(2), gates.S(2)]},
+            default=gates.Y(2),
+        )
+    )
 
 Simulation of conditional gates is not supported yet, but circuits containing
 them can be converted to OpenQASM 3 with
@@ -541,8 +561,11 @@ with Qiskit:
     qasm = circuit.to_qasm3()
     qiskit_circuit = qiskit.qasm3.loads(qasm)
 
-Programs with many mid-circuit measurements can reuse the classical registers
-whose outcomes are no longer needed with ``circuit.to_qasm3(reuse_registers=True)``.
+Conditions testing several outcomes are written as ``if``/``else if``/``else``
+chains, which Qiskit's importer can read, or as OpenQASM 3 ``switch``
+statements with ``circuit.to_qasm3(switch_statement=True)``. Programs with many
+mid-circuit measurements can reuse the classical registers whose outcomes are
+no longer needed with ``circuit.to_qasm3(reuse_registers=True)``.
 
 
 How to invert a circuit?

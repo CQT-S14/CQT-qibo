@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+from openqasm3 import parser
 
 from qibo import Circuit, __version__, gates
 
@@ -231,6 +232,131 @@ def test_qasm2_regressions():
     )
 
 
+def switch_circuit(default=True):
+    circuit = Circuit(3)
+    circuit.add(gates.H(0))
+    circuit.add(gates.H(1))
+    result = circuit.add(gates.M(0, 1, collapse=True))
+    circuit.add(
+        gates.Condition(
+            result,
+            {0: gates.X(2), (1, "10"): [gates.H(2), gates.T(2)]},
+            default=gates.Y(2) if default else None,
+        )
+    )
+    return circuit
+
+
+def test_qasm3_if_else():
+    circuit = Circuit(2)
+    result = circuit.add(gates.M(0, collapse=True))
+    circuit.add(
+        gates.Condition(
+            result.symbols[0], 1, [gates.X(1), gates.H(0)], default=gates.Z(1)
+        )
+    )
+    assert circuit.to_qasm3().endswith(
+        "if (register0[0]) {\n  x q[1];\n  h q[0];\n} else {\n  z q[1];\n}"
+    )
+
+
+@pytest.mark.parametrize("default", [False, True])
+def test_qasm3_switch_as_if_chain(default):
+    qasm = switch_circuit(default).to_qasm3()
+    target = (
+        "if (register0 == 0) {\n"
+        "  x q[2];\n"
+        "} else if (register0 == 2) {\n"
+        "  h q[2];\n"
+        "  t q[2];\n"
+        "} else if (register0 == 1) {\n"
+        "  h q[2];\n"
+        "  t q[2];\n"
+    )
+    target += "} else {\n  y q[2];\n}" if default else "}"
+    assert qasm.endswith(target)
+
+
+@pytest.mark.parametrize("default", [False, True])
+def test_qasm3_switch_statement(default):
+    qasm = switch_circuit(default).to_qasm3(switch_statement=True)
+    target = (
+        "switch (int(register0)) {\n"
+        "  case 0 {\n"
+        "    x q[2];\n"
+        "  }\n"
+        "  case 2, 1 {\n"
+        "    h q[2];\n"
+        "    t q[2];\n"
+        "  }\n"
+    )
+    target += "  default {\n    y q[2];\n  }\n}" if default else "}"
+    assert qasm.endswith(target)
+    # valid according to the OpenQASM 3 reference parser
+    parser.parse(qasm)
+
+
+def test_qasm3_switch_statement_single_value_is_if():
+    circuit = Circuit(2)
+    result = circuit.add(gates.M(0, collapse=True))
+    circuit.add(gates.Condition(result.symbols[0], {1: gates.X(1)}, default=gates.Z(1)))
+    circuit.add(gates.Condition(result.symbols[0], [0, 1], [gates.H(1), gates.S(1)]))
+    qasm = circuit.to_qasm3(switch_statement=True)
+    assert "if (register0[0]) {\n  x q[1];\n} else {\n  z q[1];\n}" in qasm
+    assert qasm.endswith(
+        "switch (int(register0[0])) {\n"
+        "  case 0 {\n    h q[1];\n  }\n"
+        "  case 1 {\n    s q[1];\n  }\n"
+        "}"
+    )
+    parser.parse(qasm)
+
+
+def test_qasm3_nested_conditions():
+    circuit = Circuit(3)
+    first = circuit.add(gates.M(0, collapse=True))
+    second = circuit.add(gates.M(1, collapse=True))
+    inner = gates.Condition(second.symbols[0], 1, gates.X(2), default=gates.RY(2, 0.5))
+    circuit.add(gates.Condition(first.symbols[0], 1, [gates.H(2), inner]))
+    assert circuit.to_qasm3().endswith(
+        "if (register0[0]) {\n"
+        "  h q[2];\n"
+        "  if (register1[0]) {\n"
+        "    x q[2];\n"
+        "  } else {\n"
+        "    ry(0.5) q[2];\n"
+        "  }\n"
+        "}"
+    )
+
+
+def test_qasm3_body_circuit():
+    body = Circuit(2)
+    body.add(gates.H(0))
+    body.add(gates.RZZ(0, 1, 0.1))
+    circuit = Circuit(4)
+    result = circuit.add(gates.M(0, collapse=True))
+    circuit.add(gates.Condition(result.symbols[0], 1, body.on_qubits(3, 1)))
+    qasm = circuit.to_qasm3()
+    assert qasm.splitlines()[3].startswith("gate rzz(")
+    assert qasm.endswith("if (register0[0]) {\n  h q[3];\n  rzz(0.1) q[3], q[1];\n}")
+
+
+@pytest.mark.parametrize("switch", [False, True])
+def test_qasm3_reuse_registers_nested(switch):
+    """Registers read by nested conditions stay alive until the outer one."""
+    circuit = Circuit(3)
+    first = circuit.add(gates.M(0, collapse=True))
+    second = circuit.add(gates.M(1, collapse=True))
+    inner = gates.Condition(first.symbols[0], 1, gates.X(2))
+    circuit.add(gates.Condition(second.symbols[0], [0, 1], [inner, gates.Z(2)]))
+    third = circuit.add(gates.M(2, collapse=True))
+    circuit.add(gates.Condition(third.symbols[0], 1, gates.X(0)))
+    qasm = circuit.to_qasm3(reuse_registers=True, switch_statement=switch)
+    assert qasm.count("bit[1]") == 2
+    assert "register0[0] = measure q[2];" in qasm
+
+
 # ---------------------------------------------------------------------------
 # Round trips through Qiskit's OpenQASM 3 importer
 # ---------------------------------------------------------------------------
@@ -371,3 +497,39 @@ def test_qiskit_reused_registers():
         # qubit 0 is always reset, qubit 1 flipped once per outcome 1
         assert {key[0] for key in counts} == {"0"}
         assert {key[1] for key in counts} == {"0", "1"}
+
+
+@pytest.mark.parametrize("prepared", range(4))
+def test_qiskit_switch(prepared):
+    """Each prepared two-qubit outcome selects its branch."""
+    circuit = Circuit(3)
+    if prepared & 2:
+        circuit.add(gates.X(0))
+    if prepared & 1:
+        circuit.add(gates.X(1))
+    result = circuit.add(gates.M(0, 1, collapse=True))
+    # 0 -> leave |0>, 1 or 2 -> |1>, otherwise (3) -> |1> then H Z H = X -> |0>
+    circuit.add(
+        gates.Condition(
+            result,
+            {0: [], (1, 2): gates.X(2)},
+            default=[gates.X(2), gates.H(2), gates.Z(2), gates.H(2)],
+        )
+    )
+    circuit.add(gates.M(2))
+    expected = "1" if prepared in (1, 2) else "0"
+    assert _qiskit_counts(circuit, shots=10) == {expected: 10}
+
+
+def test_qiskit_nested_and_if_else():
+    circuit = Circuit(4)
+    circuit.add(gates.H(0))
+    circuit.add(gates.H(1))
+    first = circuit.add(gates.M(0, collapse=True))
+    second = circuit.add(gates.M(1, collapse=True))
+    # qubit 2 = first AND second, qubit 3 = NOT first
+    inner = gates.Condition(second.symbols[0], 1, gates.X(2))
+    circuit.add(gates.Condition(first.symbols[0], 1, inner, default=gates.X(3)))
+    circuit.add(gates.M(0, 1, 2, 3))
+    counts = _qiskit_counts(circuit)
+    assert set(counts) == {"0001", "0101", "1000", "1110"}
