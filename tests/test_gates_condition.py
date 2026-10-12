@@ -4,9 +4,10 @@ import json
 
 import numpy as np
 import pytest
+import sympy
 
 from qibo import Circuit, gates
-from qibo.measurements import MeasurementResult
+from qibo.measurements import MeasurementResult, MeasurementSymbol, MeasurementValue
 
 
 def feed_forward_circuit():
@@ -14,9 +15,18 @@ def feed_forward_circuit():
     circuit = Circuit(2)
     circuit.add(gates.H(0))
     result = circuit.add(gates.M(0, collapse=True))
-    circuit.add(gates.Condition(result.symbols[0], 1, gates.X(1)))
+    circuit.add(gates.Condition(result, gates.X(1)))
     circuit.add(gates.M(0, 1))
     return circuit, result
+
+
+def names(gate_list):
+    return [(g.__class__.__name__, g.qubits) for g in gate_list]
+
+
+# ---------------------------------------------------------------------------
+# Measurement results as conditions
+# ---------------------------------------------------------------------------
 
 
 def test_add_collapsing_measurement_returns_result():
@@ -26,62 +36,118 @@ def test_add_collapsing_measurement_returns_result():
     assert circuit.queue[0].register_name == "register0"
 
 
-@pytest.mark.parametrize("source", ["symbol", "result"])
-def test_condition_source(source):
-    circuit = Circuit(2)
-    result = circuit.add(gates.M(0, 1, collapse=True))
-    if source == "symbol":
-        condition = gates.Condition(result.symbols[1], 1, gates.X(0))
-        assert condition.bit == 1
-        assert condition.nbits == 1
-    else:
-        condition = gates.Condition(result, 3, gates.X(0))
-        assert condition.bit is None
-        assert condition.nbits == 2
-    assert condition.result is result
+def test_result_bits():
+    result = Circuit(3).add(gates.M(0, 1, 2, collapse=True))
+    assert result[0] is result.symbols[0]
+    assert result[-1] is result.symbols[2]
+    assert isinstance(result[1], MeasurementSymbol)
+    assert list(result) == result.symbols
 
 
-def test_condition_invalid_source():
-    with pytest.raises(TypeError):
-        gates.Condition("register0", 1, gates.X(0))
+def test_result_boolean_operators():
+    circuit = Circuit(4)
+    a = circuit.add(gates.M(0, collapse=True))
+    b = circuit.add(gates.M(1, collapse=True))
+    register = circuit.add(gates.M(2, 3, collapse=True))
+    x, y = a[0], b[0]
+    assert ~a == sympy.Not(x)
+    assert a & b == sympy.And(x, y)
+    assert a | register[1] == sympy.Or(x, register[1])
+    assert a ^ b == sympy.Xor(x, y)
+    assert register[0] & a == sympy.And(register[0], x)
+    assert (a & ~b) | (register[1] ^ a) == sympy.Or(
+        sympy.And(x, sympy.Not(y)), sympy.Xor(register[1], x)
+    )
 
 
-@pytest.mark.parametrize(
-    "value,expected",
-    [(0, 0), (3, 3), (True, 1), (np.int64(2), 2), ("10", 2), ("01", 1)],
-)
-def test_condition_values(value, expected):
-    result = Circuit(2).add(gates.M(0, 1, collapse=True))
-    condition = gates.Condition(result, value, gates.X(0))
-    assert condition.cases == [((expected,), condition.gates)]
+def test_result_comparisons():
+    circuit = Circuit(3)
+    a = circuit.add(gates.M(0, collapse=True))
+    register = circuit.add(gates.M(1, 2, collapse=True))
+    # single bits compare to the bit itself or its negation
+    assert (a == 1) is a[0]
+    assert (a == 0) == sympy.Not(a[0])
+    assert (a != 0) is a[0]
+    # registers give a comparison symbol, reused for equal values
+    equals = register == 2
+    assert isinstance(equals, MeasurementValue)
+    assert equals.result is register and equals.value == 2
+    assert (register == "10") is equals
+    assert (register != 2) == sympy.Not(equals)
+    # results compared with results keep identity semantics and stay hashable
+    assert register.__eq__(register) is NotImplemented
+    assert a != register
+    assert len({a, register, a}) == 2
 
 
 @pytest.mark.parametrize(
     "value,error",
+    [(4, ValueError), (-1, ValueError), ("1", ValueError), ("12", ValueError)],
+)
+def test_result_invalid_comparisons(value, error):
+    register = Circuit(2).add(gates.M(0, 1, collapse=True))
+    with pytest.raises(error):
+        _ = register == value
+
+
+def test_register_used_as_bit():
+    circuit = Circuit(3)
+    a = circuit.add(gates.M(0, collapse=True))
+    register = circuit.add(gates.M(1, 2, collapse=True))
+    for operation in (
+        lambda: ~register,
+        lambda: register & a,
+        lambda: a & register,
+        lambda: a[0] | register,
+        lambda: gates.Condition(register, gates.X(0)),
+    ):
+        with pytest.raises(TypeError, match="cannot be used as a single bit"):
+            operation()
+
+
+def test_condition_expressions():
+    circuit = Circuit(4)
+    a = circuit.add(gates.M(0, collapse=True))
+    b = circuit.add(gates.M(1, collapse=True))
+    register = circuit.add(gates.M(2, 3, collapse=True))
+    condition = gates.Condition(a, gates.X(0))
+    assert condition.expression is a[0]
+    assert condition.results == [a]
+    condition = gates.Condition((register == 3) & ~b | a, gates.X(0))
+    assert condition.atoms == [a[0], b[0], register == 3]
+    assert condition.results == [a, b, register]
+    assert condition.target is None and condition.cases is None
+    assert names(condition.body) == [("X", (0,))]
+    assert condition.draw_label == "if"
+
+
+@pytest.mark.parametrize(
+    "build,error,match",
     [
-        (4, ValueError),
-        (-1, ValueError),
-        ("1", ValueError),
-        ("12", ValueError),
-        (1.0, TypeError),
-        (None, TypeError),
+        (lambda a, x: a[0] == 1, TypeError, "Python ``bool``"),
+        (lambda a, x: sympy.true, ValueError, "always True"),
+        (lambda a, x: a[0] & x, TypeError, "can only depend on measurement"),
+        (lambda a, x: sympy.Eq(a[0], 1), TypeError, "must be a measured bit"),
+        (lambda a, x: a[0] & sympy.Eq(x, 1), TypeError, "sympy relations"),
+        (lambda a, x: "register0", TypeError, "must be a measured bit"),
+        (lambda a, x: 2 * a[0], TypeError, "must be a measured bit"),
     ],
 )
-def test_condition_invalid_values(value, error):
-    result = Circuit(2).add(gates.M(0, 1, collapse=True))
-    with pytest.raises(error):
-        gates.Condition(result, value, gates.X(0))
+def test_condition_invalid_expressions(build, error, match):
+    a = Circuit(1).add(gates.M(0, collapse=True))
+    with pytest.raises(error, match=match):
+        gates.Condition(build(a, sympy.Symbol("x")), gates.X(0))
 
 
-def test_condition_bit_value_range():
-    result = Circuit(2).add(gates.M(0, 1, collapse=True))
-    with pytest.raises(ValueError):
-        gates.Condition(result.symbols[0], 2, gates.X(0))
+def test_condition_former_value_argument():
+    result = Circuit(2).add(gates.M(0, collapse=True))
+    with pytest.raises(TypeError, match="result == value"):
+        gates.Condition(result[0], 1, gates.X(1))
 
 
 def test_condition_qubits():
     result = Circuit(3).add(gates.M(2, collapse=True))
-    condition = gates.Condition(result.symbols[0], 1, gates.CNOT(1, 0))
+    condition = gates.Condition(result, gates.CNOT(1, 0))
     assert condition.target_qubits == (0, 1)
     assert condition.control_qubits == ()
     assert condition.qubits == (0, 1)
@@ -93,9 +159,14 @@ def test_condition_qubits():
 def test_condition_invalid_gates(gate):
     result = Circuit(2).add(gates.M(0, collapse=True))
     with pytest.raises(NotImplementedError):
-        gates.Condition(result.symbols[0], 1, gate)
+        gates.Condition(result, gate)
     with pytest.raises(TypeError):
-        gates.Condition(result.symbols[0], 1, "x")
+        gates.Condition(result, "x")
+
+
+# ---------------------------------------------------------------------------
+# Integration with Circuit
+# ---------------------------------------------------------------------------
 
 
 def test_condition_unsupported_operations():
@@ -120,17 +191,18 @@ def test_condition_simulation_error(density_matrix):
     """The error is raised before any check on the measurements."""
     circuit = Circuit(2, density_matrix=density_matrix)
     result = circuit.add(gates.M(0, collapse=True))
-    circuit.add(gates.Condition(result.symbols[0], 1, gates.X(1)))
+    circuit.add(gates.Condition(result, gates.X(1)))
     with pytest.raises(NotImplementedError, match="Simulation of ``Condition``"):
         circuit()
 
 
-def test_condition_turns_final_measurement_into_mid_circuit():
-    circuit = Circuit(2)
-    result = circuit.add(gates.M(0))
-    assert circuit.measurements
-    circuit.add(gates.Condition(result.symbols[0], 1, gates.X(1)))
-    assert circuit.queue[0].collapse
+def test_condition_turns_final_measurements_into_mid_circuit():
+    circuit = Circuit(3)
+    a = circuit.add(gates.M(0))
+    b = circuit.add(gates.M(1))
+    assert len(circuit.measurements) == 2
+    circuit.add(gates.Condition(a & ~b, gates.X(2)))
+    assert circuit.queue[0].collapse and circuit.queue[1].collapse
     assert not circuit.measurements
     assert circuit.has_collapse
 
@@ -139,21 +211,23 @@ def test_condition_parameters_can_be_updated():
     circuit = Circuit(2)
     result = circuit.add(gates.M(0, collapse=True))
     circuit.add(gates.RX(0, 0.1))
-    circuit.add(gates.Condition(result.symbols[0], 1, gates.RY(1, 0.2)))
+    circuit.add(gates.Condition(result, gates.RY(1, 0.2)))
     circuit.set_parameters([0.3, 0.4])
     assert circuit.queue[-1].gates[0].parameters == (0.4,)
     assert circuit.get_parameters() == [(0.3,), (0.4,)]
 
 
-def test_condition_moments_after_measurement():
-    circuit, _ = feed_forward_circuit()
+def test_condition_moments_after_measurements():
+    circuit = Circuit(3)
+    a = circuit.add(gates.M(0, collapse=True))
+    circuit.add(gates.H(1))
+    circuit.add(gates.H(1))
+    b = circuit.add(gates.M(1, collapse=True))
+    circuit.add(gates.Condition(a | b, gates.X(2)))
     moments = circuit.queue.moments
-    measured = next(i for i, m in enumerate(moments) if isinstance(m[0], gates.M))
-    conditioned = next(
-        i for i, m in enumerate(moments) if isinstance(m[1], gates.Condition)
-    )
-    assert conditioned > measured
-    assert circuit.depth == 4
+    # the condition on qubit 2 waits for the second measurement (moment 2)
+    assert isinstance(moments[3][2], gates.Condition)
+    assert all(moment[2] is None for moment in moments[:3])
 
 
 def test_condition_draw():
@@ -166,60 +240,80 @@ def test_condition_on_qubits():
     large = Circuit(4)
     large.add(small.on_qubits(3, 1))
     condition = large.queue[2]
-    assert condition.result is result
+    assert condition.results == [result]
     assert condition.qubits == (1,)
     assert "if (register0[0]) {\n  x q[1];\n}" in large.to_qasm3()
     assert "register0[0] = measure q[3];" in large.to_qasm3()
 
 
+def expression_circuit():
+    circuit = Circuit(4)
+    circuit.add([gates.H(0), gates.H(1), gates.H(2)])
+    a = circuit.add(gates.M(0, collapse=True))
+    register = circuit.add(gates.M(1, 2, collapse=True))
+    circuit.add(
+        gates.Condition(
+            (register != 1) & ~a | (register[1] ^ a), gates.X(3), default=gates.Z(3)
+        )
+    )
+    circuit.add(gates.M(3))
+    return circuit
+
+
 def test_condition_raw_roundtrip():
-    circuit, _ = feed_forward_circuit()
+    circuit = expression_circuit()
     raw = json.loads(json.dumps(circuit.raw))
-    assert raw["queue"][2]["source"] == {"measurement": 0, "bit": 0}
+    condition = raw["queue"][5]["condition"]
+    assert set(condition) == {"or"}
+    conjunction = next(arg["and"] for arg in condition["or"] if "and" in arg)
+    assert {"not": [{"bit": [0, 0]}]} in conjunction
     new = Circuit.from_dict(raw)
     assert new.to_qasm3() == circuit.to_qasm3()
-    assert new.queue[2].result is new.queue[1].result
+    assert new.queue[5].results == [new.queue[3].result, new.queue[4].result]
     with pytest.raises(NotImplementedError):
-        _ = circuit.queue[2].raw
+        _ = circuit.queue[5].raw
 
 
 def test_condition_raw_unresolved():
     result = Circuit(1).add(gates.M(0, collapse=True))
     circuit = Circuit(1)
-    circuit.add(gates.Condition(result.symbols[0], 1, gates.X(0)))
+    circuit.add(gates.Condition(result, gates.X(0)))
     with pytest.raises(ValueError):
         _ = circuit.raw
 
 
 def test_condition_deep_copy():
-    circuit, result = feed_forward_circuit()
+    circuit = expression_circuit()
     new = circuit.copy(deep=True)
-    assert new.queue[1].result is not result
-    assert new.queue[2].result is new.queue[1].result
-    assert new.queue[2].gates[0] is not circuit.queue[2].gates[0]
+    old_results = circuit.queue[5].results
+    new_results = new.queue[5].results
+    assert new_results == [new.queue[3].result, new.queue[4].result]
+    assert all(r is not s for r, s in zip(new_results, old_results))
+    assert new.queue[5].gates[0] is not circuit.queue[5].gates[0]
     assert new.to_qasm3() == circuit.to_qasm3()
 
 
 def test_condition_light_cone():
-    circuit = Circuit(3)
+    circuit = Circuit(4)
     circuit.add(gates.H(0))
-    result = circuit.add(gates.M(0, collapse=True))
-    circuit.add(gates.H(2))
-    circuit.add(gates.Condition(result.symbols[0], 1, gates.X(1)))
-    small, qubit_map = circuit.light_cone(1)
-    assert qubit_map == {0: 0, 1: 1}
-    assert [g.__class__.__name__ for g in small.queue] == ["H", "M", "Condition"]
-    assert small.queue[2].result is small.queue[1].result
+    a = circuit.add(gates.M(0, collapse=True))
+    b = circuit.add(gates.M(1, collapse=True))
+    circuit.add(gates.H(3))
+    circuit.add(gates.Condition(a & b, gates.X(2)))
+    small, qubit_map = circuit.light_cone(2)
+    assert qubit_map == {0: 0, 1: 1, 2: 2}
+    assert [g.__class__.__name__ for g in small.queue] == ["H", "M", "M", "Condition"]
+    assert small.queue[3].results == [small.queue[1].result, small.queue[2].result]
 
 
 def test_condition_decompose():
     circuit = Circuit(3)
     result = circuit.add(gates.M(0, collapse=True))
-    circuit.add(gates.Condition(result.symbols[0], 1, gates.SX(1)))
+    circuit.add(gates.Condition(result, gates.SX(1)))
     new = circuit.decompose()
     condition = new.queue[1]
     assert isinstance(condition, gates.Condition)
-    assert condition.result is new.queue[0].result
+    assert condition.results == [new.queue[0].result]
     assert [g.__class__.__name__ for g in condition.gates] == ["RX"]
 
 
@@ -227,21 +321,17 @@ def test_condition_not_fused():
     circuit = Circuit(2)
     circuit.add(gates.H(1))
     result = circuit.add(gates.M(0, collapse=True))
-    circuit.add(gates.Condition(result.symbols[0], 1, gates.X(1)))
+    circuit.add(gates.Condition(result, gates.X(1)))
     circuit.add(gates.H(1))
     fused = circuit.fuse()
-    names = [g.__class__.__name__ for g in fused.queue]
-    assert names.index("Condition") > names.index("M")
+    names_ = [g.__class__.__name__ for g in fused.queue]
+    assert names_.index("Condition") > names_.index("M")
     assert fused.to_qasm3() == circuit.to_qasm3()
 
 
 # ---------------------------------------------------------------------------
-# Several gates per branch, if/else and switch
+# Bodies, if/else and switch
 # ---------------------------------------------------------------------------
-
-
-def names(gate_list):
-    return [(g.__class__.__name__, g.qubits) for g in gate_list]
 
 
 def test_condition_body_forms():
@@ -256,9 +346,9 @@ def test_condition_body_forms():
         [gates.H(1), [gates.CNOT(1, 2)]],
         small.on_qubits(1, 2),
     ):
-        condition = gates.Condition(result.symbols[0], 1, body)
+        condition = gates.Condition(result, body)
         assert names(condition.gates) == expected
-    condition = gates.Condition(result.symbols[0], 1, small)
+    condition = gates.Condition(result, small)
     assert names(condition.gates) == [("H", (0,)), ("CNOT", (0, 1))]
     assert condition.gates[0] is small.queue[0]
 
@@ -268,58 +358,66 @@ def test_condition_body_circuit_with_measurement():
     body = Circuit(2)
     body.add(gates.M(1))
     with pytest.raises(NotImplementedError):
-        gates.Condition(result.symbols[0], 1, body)
+        gates.Condition(result, body)
 
 
 def test_condition_if_else():
     result = Circuit(2).add(gates.M(0, collapse=True))
-    condition = gates.Condition(
-        result.symbols[0], 1, gates.X(1), default=[gates.H(1), gates.Z(0)]
-    )
-    assert condition.cases == [((1,), condition.gates[:1])]
+    condition = gates.Condition(result, gates.X(1), default=[gates.H(1), gates.Z(0)])
+    assert names(condition.body) == [("X", (1,))]
     assert names(condition.default) == [("H", (1,)), ("Z", (0,))]
+    assert condition.branches == [condition.body, condition.default]
     assert condition.qubits == (0, 1)
-    assert condition.draw_label == "if"
-
-
-def test_condition_switch_forms():
-    result = Circuit(3).add(gates.M(0, 1, collapse=True))
-    x, h, t = gates.X(2), gates.H(2), gates.T(2)
-    from_dict = gates.Condition(result, {0: x, (1, "10"): [h, t]}, default=gates.Y(2))
-    from_lists = gates.Condition(
-        result, [0, (1, "10")], [x, [h, t]], default=gates.Y(2)
-    )
-    for condition in (from_dict, from_lists):
-        assert condition.cases == [((0,), [x]), ((1, 2), [h, t])]
-        assert names(condition.default) == [("Y", (2,))]
-        assert condition.draw_label == "switch"
-
-
-def test_condition_switch_empty_case():
-    result = Circuit(2).add(gates.M(0, collapse=True))
-    condition = gates.Condition(result.symbols[0], {0: [], 1: gates.X(1)})
-    assert condition.cases[0] == ((0,), [])
-    assert condition.qubits == (1,)
 
 
 @pytest.mark.parametrize(
-    "value,body,error",
+    "cases,expected",
     [
-        ({0: gates.X(1)}, gates.X(1), ValueError),
-        ([0, 1], [gates.X(1)], ValueError),
-        ([0, 1], gates.X(1), ValueError),
-        ({0: gates.X(1), (1, 0): gates.Z(1)}, None, ValueError),
-        ({}, None, ValueError),
-        ({(): gates.X(1)}, None, ValueError),
-        (1, None, ValueError),
-        (1, [], ValueError),
-        ({0: [], 1: []}, None, ValueError),
+        ({0: "x", (1, "10"): "ht"}, [((0,), "x"), ((1, 2), "ht")]),
+        ({3: "x", np.int64(1): "ht"}, [((3,), "x"), ((1,), "ht")]),
+        ({"11": "x", (0, 2): "ht"}, [((3,), "x"), ((0, 2), "ht")]),
     ],
 )
-def test_condition_switch_errors(value, body, error):
-    result = Circuit(2).add(gates.M(0, collapse=True))
+def test_condition_switch(cases, expected):
+    result = Circuit(3).add(gates.M(0, 1, collapse=True))
+    bodies = {"x": [gates.X(2)], "ht": [gates.H(2), gates.T(2)]}
+    cases = {values: bodies[body] for values, body in cases.items()}
+    condition = gates.Condition(result, cases, default=gates.Y(2))
+    assert condition.target is result and condition.expression is None
+    assert condition.cases == [(values, bodies[body]) for values, body in expected]
+    assert names(condition.default) == [("Y", (2,))]
+    assert condition.draw_label == "switch"
+    assert condition.results == [result]
+
+
+def test_condition_switch_on_bit():
+    result = Circuit(3).add(gates.M(0, 1, collapse=True))
+    condition = gates.Condition(result[1], {0: [], 1: gates.X(2)})
+    assert condition.target is result[1]
+    assert condition.cases[0] == ((0,), [])
+    assert condition.qubits == (2,)
+
+
+@pytest.mark.parametrize(
+    "target,cases,error",
+    [
+        ("result", {0: gates.X(1), (1, 0): gates.Z(1)}, ValueError),
+        ("result", {}, ValueError),
+        ("result", {(): gates.X(1)}, ValueError),
+        ("result", {2: gates.X(1)}, ValueError),
+        ("result", {0: [], 1: []}, ValueError),
+        ("result", {0: "x"}, TypeError),
+        ("expression", {0: gates.X(1)}, TypeError),
+        ("string", {0: gates.X(1)}, TypeError),
+    ],
+)
+def test_condition_switch_errors(target, cases, error):
+    circuit = Circuit(2)
+    result = circuit.add(gates.M(0, collapse=True))
+    other = circuit.add(gates.M(1, collapse=True))
+    target = {"result": result, "expression": result & other, "string": "a"}[target]
     with pytest.raises(error):
-        gates.Condition(result.symbols[0], value, body)
+        gates.Condition(target, cases)
 
 
 def nested_circuit():
@@ -328,8 +426,8 @@ def nested_circuit():
     circuit.add(gates.H(1))
     first = circuit.add(gates.M(0, collapse=True))
     second = circuit.add(gates.M(1, collapse=True))
-    inner = gates.Condition(second.symbols[0], 1, gates.X(2), default=gates.RY(2, 0.3))
-    circuit.add(gates.Condition(first.symbols[0], 1, [gates.H(2), inner]))
+    inner = gates.Condition(second, gates.X(2), default=gates.RY(2, 0.3))
+    circuit.add(gates.Condition(first, [gates.H(2), inner]))
     circuit.add(gates.M(2))
     return circuit
 
@@ -337,9 +435,9 @@ def nested_circuit():
 def test_condition_nested():
     circuit = nested_circuit()
     condition = circuit.queue[4]
-    assert [c.result for c in condition._nested_conditions()] == [
-        circuit.queue[2].result,
-        circuit.queue[3].result,
+    assert [c.results for c in condition._nested_conditions()] == [
+        [circuit.queue[2].result],
+        [circuit.queue[3].result],
     ]
     assert names(condition._nested_gates()) == [("H", (2,)), ("X", (2,)), ("RY", (2,))]
     # parameters of nested gates are registered
@@ -355,28 +453,27 @@ def test_condition_nested():
 def test_condition_nested_raw_and_copy():
     circuit = nested_circuit()
     raw = json.loads(json.dumps(circuit.raw))
-    assert raw["queue"][4]["cases"][0]["gates"][1]["source"] == {
-        "measurement": 1,
-        "bit": 0,
-    }
+    assert raw["queue"][4]["body"][1]["condition"] == {"bit": [1, 0]}
     loaded = Circuit.from_dict(raw)
     copied = circuit.copy(deep=True)
     for new in (loaded, copied):
         assert new.to_qasm3() == circuit.to_qasm3()
         inner = new.queue[4].gates[1]
-        assert inner.result is new.queue[3].result
+        assert inner.results == [new.queue[3].result]
     with pytest.raises(ValueError):
         gates.Gate.from_dict(raw["queue"][4])
 
 
-def test_condition_switch_raw_roundtrip():
+@pytest.mark.parametrize("target", ["register", "bit"])
+def test_condition_switch_raw_roundtrip(target):
     circuit = Circuit(3)
     result = circuit.add(gates.M(0, 1, collapse=True))
-    circuit.add(
-        gates.Condition(result, {0: gates.X(2), (1, 2): []}, default=gates.Y(2))
-    )
-    loaded = Circuit.from_dict(json.loads(json.dumps(circuit.raw)))
-    assert loaded.queue[1].cases[1][0] == (1, 2)
-    assert loaded.to_qasm3(switch_statement=True) == circuit.to_qasm3(
-        switch_statement=True
-    )
+    target = result if target == "register" else result[1]
+    circuit.add(gates.Condition(target, {0: gates.X(2), (1,): []}, default=gates.Y(2)))
+    raw = json.loads(json.dumps(circuit.raw))
+    loaded = Circuit.from_dict(raw)
+    assert loaded.queue[1].cases[1][0] == (1,)
+    for compatible in (True, False):
+        assert loaded.to_qasm3(qiskit_compatible=compatible) == circuit.to_qasm3(
+            qiskit_compatible=compatible
+        )

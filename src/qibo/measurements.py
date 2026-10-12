@@ -1,4 +1,5 @@
 from collections import Counter
+from numbers import Integral
 
 import sympy
 
@@ -69,11 +70,77 @@ class MeasurementSymbol(sympy.Symbol):
         return expr.subs(self, self.outcome())
 
 
+class MeasurementValue(sympy.Symbol):
+    """``sympy.Symbol`` that is true when a measured register has a given value.
+
+    Created by comparing a :class:`qibo.measurements.MeasurementResult` with an
+    outcome, as in ``result == 2``, to be used in the conditions of
+    :class:`qibo.gates.Condition`.
+    """
+
+    _counter = 0
+
+    def __new__(cls, *args, **kwargs):
+        name = f"v{cls._counter}"
+        cls._counter += 1
+        return super().__new__(cls=cls, name=name)
+
+    def __init__(self, result, value):
+        self.result = result
+        self.value = value
+
+    def __getstate__(self):
+        return {"result": self.result, "value": self.value, "name": self.name}
+
+    def __setstate__(self, data):
+        self.result = data.get("result")
+        self.value = data.get("value")
+        self.name = data.get("name")
+
+
+def parse_outcome(value, nbits: int) -> int:
+    """Converts an outcome of ``nbits`` measured bits to an integer.
+
+    Args:
+        value (int or str): integer in :math:`[0, 2^{n})`, or bitstring of length
+            :math:`n` where the first bit is the most significant.
+        nbits (int): number of measured bits.
+
+    Returns:
+        int: the outcome as an integer.
+    """
+    if isinstance(value, str):
+        if len(value) != nbits or set(value) - {"0", "1"}:
+            raise_error(
+                ValueError,
+                f"Bitstring {value!r} is not a valid outcome of {nbits} measured bits.",
+            )
+        return int(value, 2)
+    if not isinstance(value, Integral):
+        raise_error(
+            TypeError,
+            f"Measurement outcomes must be integers or bitstrings, but got {value!r}.",
+        )
+    if not 0 <= value < 2**nbits:
+        raise_error(
+            ValueError,
+            f"Value {value} is not a possible outcome of {nbits} measured bits.",
+        )
+    return int(value)
+
+
 class MeasurementResult:
     """Data structure for holding measurement outcomes.
 
     :class:`qibo.measurements.MeasurementResult` objects can be obtained
     when adding measurement gates to a circuit.
+
+    The outcomes can also be used to build the conditions of
+    :class:`qibo.gates.Condition`: ``result[i]`` is the symbol of the
+    :math:`i`-th measured bit (the same as ``result.symbols[i]``), a result of a
+    single qubit can be used directly as a bit, bits are combined with ``&``,
+    ``|``, ``^`` and ``~``, and ``result == value`` (or ``!=``) compares the
+    whole register with an integer or a bitstring.
 
     Args:
         gate (:class:`qibo.gates.M`): Measurement gate associated with
@@ -92,6 +159,65 @@ class MeasurementResult:
         self._bitflip_p0 = None
         self._bitflip_p1 = None
         self._symbols = None
+        self._values = {}
+
+    # ``==`` builds conditions on the outcome, results stay hashable by identity
+    __hash__ = object.__hash__
+
+    def __getitem__(self, index: int) -> MeasurementSymbol:
+        """Symbol of a measured bit, the same as ``result.symbols[index]``."""
+        return self.symbols[index]
+
+    def _bit(self) -> MeasurementSymbol:
+        """Symbol of the measured bit, for results of a single qubit."""
+        nbits = len(self.target_qubits)
+        if nbits != 1:
+            raise_error(
+                TypeError,
+                f"A measurement of {nbits} qubits cannot be used as a single bit. "
+                + "Use one of its bits, as in ``result[0]``, or compare it with a "
+                + "value, as in ``result == 2``.",
+            )
+        return self.symbols[0]
+
+    def _sympy_(self):
+        return self._bit()
+
+    def __invert__(self):
+        return ~self._bit()
+
+    def __and__(self, other):
+        return self._bit() & other
+
+    def __rand__(self, other):
+        return other & self._bit()
+
+    def __or__(self, other):
+        return self._bit() | other
+
+    def __ror__(self, other):
+        return other | self._bit()
+
+    def __xor__(self, other):
+        return self._bit() ^ other
+
+    def __rxor__(self, other):
+        return other ^ self._bit()
+
+    def __eq__(self, value):
+        if not isinstance(value, (Integral, str)):
+            return NotImplemented
+        nbits = len(self.target_qubits)
+        value = parse_outcome(value, nbits)
+        if nbits == 1:
+            return self.symbols[0] if value else ~self.symbols[0]
+        if value not in self._values:
+            self._values[value] = MeasurementValue(self, value)
+        return self._values[value]
+
+    def __ne__(self, value):
+        condition = self.__eq__(value)
+        return condition if condition is NotImplemented else ~condition
 
     def __repr__(self):
         qubits = self.target_qubits

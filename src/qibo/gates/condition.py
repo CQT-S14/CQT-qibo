@@ -3,45 +3,47 @@
 import copy
 from numbers import Integral
 
+from sympy.core.relational import Relational
+from sympy.logic.boolalg import And, Boolean, Not, Or, Xor, to_nnf
+
 from qibo.config import raise_error
 from qibo.gates.abstract import Gate, SpecialGate
 from qibo.gates.measurements import M
-from qibo.measurements import MeasurementResult, MeasurementSymbol
+from qibo.measurements import (
+    MeasurementResult,
+    MeasurementSymbol,
+    MeasurementValue,
+    parse_outcome,
+)
 
 __all__ = ["Condition"]
 
 
 class Condition(Gate):
-    """Applies gates only if a mid-circuit measurement has a given outcome.
+    """Applies gates only if mid-circuit measurements have given outcomes.
 
-    The outcome is referenced through the objects returned when a measurement
-    is added to a circuit, in the same way as measurement symbols are used to
-    parametrize gates:
+    The outcomes are referenced through the result returned when a measurement
+    is added to a circuit, ``result = circuit.add(gates.M(..., collapse=True))``:
 
-    - a single measured bit, :class:`qibo.measurements.MeasurementSymbol`
-      (``result.symbols[i]``), compared against ``0`` or ``1``;
-    - the full measurement register, :class:`qibo.measurements.MeasurementResult`,
-      compared against an integer or a bitstring.
+    - ``result[i]`` is the :math:`i`-th measured bit, which is true when it was
+      measured in state 1. A result of a single qubit is itself a bit;
+    - bits are combined with ``&`` (and), ``|`` (or), ``^`` (xor) and ``~`` (not);
+    - ``result == value`` and ``result != value`` compare the whole register with
+      an integer or a bitstring.
 
-    Register values follow qibo's bitstring convention: ``result.symbols[0]``
-    is the most significant bit. For example, after
-    ``result = circuit.add(gates.M(0, 1, collapse=True))`` the value ``2``
-    (or ``"10"``) means that the first measured bit is ``1`` and the second is ``0``.
+    Register values follow qibo's bitstring convention: ``result[0]`` is the
+    most significant bit. For example, after
+    ``result = circuit.add(gates.M(0, 1, collapse=True))``, ``result == 2`` (or
+    ``result == "10"``) means that the first measured bit is 1 and the second is 0.
 
-    A condition can test a single value (``if``), or several values each with
-    its own gates, like a ``switch`` statement:
+    If ``body`` is a dictionary, the condition is a ``switch``: ``condition`` is a
+    measured register or bit, and the body of the matching value is applied.
+    A tuple of values, as in ``{(1, 2): body}``, shares one body.
 
-    - ``Condition(source, value, body)`` applies ``body`` if the outcome is ``value``;
-    - ``Condition(source, {value: body, ...})`` applies the body of the matching value;
-    - ``Condition(source, [value, ...], [body, ...])`` is equivalent, with the values
-      and bodies given as two sequences of the same length.
-
-    A value can also be a tuple of values that share the same body, as in
-    ``{(1, 2): body}``. If ``default`` is given, it is applied when no value
-    matches (``else``). A body is a gate, a list of gates, a generator of
-    gates such as :meth:`qibo.models.circuit.Circuit.on_qubits`, or a
-    :class:`qibo.models.circuit.Circuit`, whose gates are used. Bodies may contain
-    other conditions, but not measurements.
+    A body is a gate, a list of gates, a generator of gates such as
+    :meth:`qibo.models.circuit.Circuit.on_qubits`, or a
+    :class:`qibo.models.circuit.Circuit`, whose gates are used. Bodies may
+    contain other conditions, but not measurements.
 
     Simulation of conditional gates is not supported yet. Circuits containing
     them can be exported with :meth:`qibo.models.circuit.Circuit.to_qasm3`.
@@ -51,116 +53,86 @@ class Condition(Gate):
 
             from qibo import Circuit, gates
 
-            circuit = Circuit(3)
-            circuit.add(gates.H(0))
-            circuit.add(gates.H(1))
-            bit = circuit.add(gates.M(0, collapse=True))
-            # flip qubit 2 if qubit 0 was measured in state 1
-            circuit.add(gates.Condition(bit.symbols[0], 1, gates.X(2)))
-            # if/else with several gates in each branch
+            circuit = Circuit(4)
+            circuit.add([gates.H(0), gates.H(1), gates.H(2)])
+            first = circuit.add(gates.M(0, collapse=True))
+            register = circuit.add(gates.M(1, 2, collapse=True))
+            # flip qubit 3 if qubit 0 was measured in state 1
+            circuit.add(gates.Condition(first, gates.X(3)))
+            # boolean expression, with an else branch
             circuit.add(
                 gates.Condition(
-                    bit.symbols[0], 0, [gates.H(2), gates.S(2)], default=gates.Z(2)
+                    ~first & register[1], [gates.H(3), gates.S(3)], default=gates.Z(3)
                 )
             )
-            # switch on the outcome of a two-qubit measurement
-            register = circuit.add(gates.M(0, 1, collapse=True))
+            # comparison of a register
+            circuit.add(gates.Condition(register == "10", gates.X(3)))
+            # switch on the value of a register
             circuit.add(
                 gates.Condition(
-                    register,
-                    {0: gates.X(2), (1, 2): [gates.H(2), gates.T(2)]},
-                    default=gates.Y(2),
+                    register, {0: gates.X(3), (1, 2): gates.T(3)}, default=gates.Y(3)
                 )
             )
-            circuit.add(gates.M(2))
+            circuit.add(gates.M(3))
             print(circuit.to_qasm3())
 
     Args:
-        source (:class:`qibo.measurements.MeasurementSymbol` or :class:`qibo.measurements.MeasurementResult`):
-            measured bit or register that the condition depends on.
-        value (int or str or tuple or dict or list): outcome for which ``body``
-            is applied. For a single bit, ``0`` or ``1`` (``False`` or ``True``).
-            For a register, an integer in :math:`[0, 2^{n})` or a bitstring of
-            length :math:`n`. A dictionary maps values to bodies, and a list or
-            tuple gives one value per entry of ``body``.
-        body (:class:`qibo.gates.Gate` or list or :class:`qibo.models.circuit.Circuit`, optional):
-            gates applied when the outcome is ``value``. When ``value`` is a list
-            or tuple, a list with one body per value. Not used when ``value`` is a
-            dictionary.
+        condition (:class:`qibo.measurements.MeasurementResult` or sympy.Basic):
+            boolean expression of measured bits and register comparisons. For a
+            ``switch``, the measured register or bit whose value selects the body.
+        body (:class:`qibo.gates.Gate` or list or :class:`qibo.models.circuit.Circuit` or dict):
+            gates applied when the condition is true. For a ``switch``, a
+            dictionary that maps values to bodies.
         default (:class:`qibo.gates.Gate` or list or :class:`qibo.models.circuit.Circuit`, optional):
-            gates applied when the outcome matches no value. Defaults to ``None``.
+            gates applied when the condition is false, or when no value of a
+            ``switch`` matches. Defaults to ``None``.
     """
 
-    def __init__(self, source, value, body=None, default=None):
+    def __init__(self, condition, body, default=None):
         super().__init__()
-        self._set_source(source)
-        if isinstance(value, dict):
-            if body is not None:
-                raise_error(
-                    ValueError,
-                    "``body`` cannot be given when the cases are a dictionary.",
-                )
-            pairs = list(value.items())
-        elif isinstance(value, (list, tuple, range)):
-            if not isinstance(body, (list, tuple)) or len(body) != len(value):
-                raise_error(
-                    ValueError,
-                    "When several values are given, ``body`` must be a list "
-                    + "or tuple with one body per value.",
-                )
-            pairs = list(zip(value, body))
-        else:
-            if body is None:
-                raise_error(ValueError, "Missing the ``body`` of the condition.")
-            pairs = [(value, body)]
-        if not pairs:
-            raise_error(ValueError, "A ``Condition`` needs at least one value.")
-
-        cases = [(self._parse_values(values), _body(body)) for values, body in pairs]
-        seen = set()
-        for values, _ in cases:
-            for outcome in values:
-                if outcome in seen:
-                    raise_error(
-                        ValueError,
-                        f"Value {outcome} is used by more than one case of the condition.",
-                    )
-                seen.add(outcome)
-        self._setup(cases, None if default is None else _body(default))
-
-    def _parse_values(self, values) -> tuple[int, ...]:
-        """Values of a case, as a tuple of integers in qibo's bit ordering."""
-        if isinstance(values, (list, tuple, set, frozenset)):
-            if not values:
-                raise_error(
-                    ValueError, "A case of a condition needs at least one value."
-                )
-            return tuple(self._parse_value(value) for value in values)
-        return (self._parse_value(values),)
-
-    @classmethod
-    def _from_cases(cls, source, cases, default):
-        """Creates a condition from already validated cases."""
-        gate = cls.__new__(cls)
-        Gate.__init__(gate)
-        gate._set_source(source)
-        gate._setup(cases, default)
-        return gate
-
-    def _set_source(self, source):
-        if not isinstance(source, (MeasurementSymbol, MeasurementResult)):
+        if isinstance(body, (Integral, str)):
             raise_error(
                 TypeError,
-                "The source of a ``Condition`` must be a measurement symbol "
-                + "(``result.symbols[i]``) or the measurement result returned by "
-                + f"``circuit.add(gates.M(...))``, but is {type(source)}.",
+                "Conditions are expressions of measurement outcomes: write "
+                + "``Condition(result == value, gates)`` instead of "
+                + "``Condition(result, value, gates)``.",
             )
-        self.source = source
+        default = None if default is None else _body(default)
+        if isinstance(body, dict):
+            target = _switch_target(condition)
+            nbits = _nbits(target)
+            cases = []
+            seen = set()
+            for values, case_body in body.items():
+                values = _case_values(values, nbits)
+                for value in values:
+                    if value in seen:
+                        raise_error(
+                            ValueError,
+                            f"Value {value} is used by more than one case of the condition.",
+                        )
+                    seen.add(value)
+                cases.append((values, _body(case_body)))
+            if not cases:
+                raise_error(ValueError, "A ``switch`` needs at least one case.")
+            self._setup(None, target, cases, default)
+        else:
+            self._setup(_expression(condition), None, [((), _body(body))], default)
 
-    def _setup(self, cases, default):
+    @classmethod
+    def _from_parts(cls, expression, target, cases, default):
+        """Creates a condition from already validated parts."""
+        gate = cls.__new__(cls)
+        Gate.__init__(gate)
+        gate._setup(expression, target, cases, default)
+        return gate
+
+    def _setup(self, expression, target, cases, default):
         self.name = "condition"
-        self.draw_label = "if" if len(cases) == 1 else "switch"
-        self.cases = cases
+        self.draw_label = "if" if target is None else "switch"
+        self.expression = expression
+        self.target = target
+        self._cases = cases
         self.default = default
         for gate in self.gates:
             if not isinstance(gate, Gate):
@@ -178,54 +150,51 @@ class Condition(Gate):
             raise_error(ValueError, "A ``Condition`` needs at least one gate to apply.")
         self.target_qubits = tuple(sorted(qubits))
 
-    def _parse_value(self, value) -> int:
-        """Converts a case value to an integer in qibo's bit ordering."""
-        nbits = self.nbits
-        if isinstance(value, str):
-            if len(value) != nbits or set(value) - {"0", "1"}:
-                raise_error(
-                    ValueError,
-                    f"Bitstring {value!r} is not a valid outcome of {nbits} measured bits.",
-                )
-            return int(value, 2)
-        if not isinstance(value, Integral):
-            raise_error(
-                TypeError,
-                f"Condition values must be integers or bitstrings, but got {value!r}.",
-            )
-        if not 0 <= value < 2**nbits:
-            raise_error(
-                ValueError,
-                f"Value {value} is not a possible outcome of {nbits} measured bits.",
-            )
-        return int(value)
+    @property
+    def body(self) -> list | None:
+        """Gates applied when the condition is true, ``None`` for a ``switch``."""
+        return self._cases[0][1] if self.target is None else None
 
     @property
-    def result(self) -> MeasurementResult:
-        """Measurement result that the condition depends on."""
-        if isinstance(self.source, MeasurementSymbol):
-            return self.source.result
-        return self.source
+    def cases(self) -> list | None:
+        """Pairs of values and bodies of a ``switch``, ``None`` otherwise.
+
+        Values are integers in qibo's bit ordering.
+        """
+        return None if self.target is None else self._cases
 
     @property
-    def bit(self) -> int | None:
-        """Index of the measured bit, or ``None`` if the full register is used."""
-        if isinstance(self.source, MeasurementSymbol):
-            return self.source.index
-        return None
+    def atoms(self) -> list:
+        """Measured bits and register comparisons in the condition.
+
+        For a ``switch``, the measured register or bit.
+        """
+        if self.target is not None:
+            return [self.target]
+        return sorted(self.expression.free_symbols, key=_atom_order)
 
     @property
-    def nbits(self) -> int:
-        """Number of measured bits that the condition depends on."""
-        return 1 if self.bit is not None else len(self.result.target_qubits)
+    def results(self) -> list:
+        """Measurement results that the condition reads, without repetitions."""
+        results = []
+        for atom in self.atoms:
+            result = atom if isinstance(atom, MeasurementResult) else atom.result
+            if not any(result is other for other in results):
+                results.append(result)
+        return results
+
+    @property
+    def branches(self) -> list:
+        """Lists of gates of all branches, ending with the default one if given."""
+        branches = [body for _, body in self._cases]
+        if self.default is not None:
+            branches.append(self.default)
+        return branches
 
     @property
     def gates(self) -> list:
         """All gates of all branches, without descending into nested conditions."""
-        gates = [gate for _, body in self.cases for gate in body]
-        if self.default is not None:
-            gates += self.default
-        return gates
+        return [gate for branch in self.branches for gate in branch]
 
     def _nested_conditions(self):
         """Yields this condition and all conditions nested in its branches."""
@@ -243,15 +212,15 @@ class Condition(Gate):
                 yield gate
 
     def _map_bodies(self, func) -> "Condition":
-        """New condition with the same source and ``func`` applied to each branch."""
-        cases = [(values, func(body)) for values, body in self.cases]
+        """New condition with the same test and ``func`` applied to each branch."""
+        cases = [(values, func(body)) for values, body in self._cases]
         default = None if self.default is None else func(self.default)
-        return self._from_cases(self.source, cases, default)
+        return self._from_parts(self.expression, self.target, cases, default)
 
     def on_qubits(self, qubit_map: dict) -> "Condition":
         """Creates the same condition with its gates acting on different qubits.
 
-        The measurement the condition depends on is not changed, so mapping a
+        The measurements the condition depends on are not changed, so mapping a
         whole circuit (for example with
         :meth:`qibo.models.circuit.Circuit.on_qubits`) keeps conditions linked
         to the mapped measurements.
@@ -275,14 +244,17 @@ class Condition(Gate):
         return [self._map_bodies(decompose_body)]
 
     def _copy(self, results: dict) -> "Condition":
-        """Copy whose gates are new objects and whose source is remapped.
+        """Copy whose gates are new objects and whose measurements are remapped.
 
         Args:
             results (dict): maps ``id`` of old measurement results to the new
                 :class:`qibo.measurements.MeasurementResult` objects.
         """
-        result = results.get(id(self.result), self.result)
-        source = result if self.bit is None else result.symbols[self.bit]
+
+        def remap(atom):
+            old = atom if isinstance(atom, MeasurementResult) else atom.result
+            new = results.get(id(old), old)
+            return _rebuild_atom(atom, new)
 
         def copy_body(body):
             return [
@@ -290,32 +262,40 @@ class Condition(Gate):
                 for g in body
             ]
 
-        cases = [(values, copy_body(body)) for values, body in self.cases]
+        expression, target = self.expression, self.target
+        if target is not None:
+            target = remap(target)
+        else:
+            expression = expression.xreplace({atom: remap(atom) for atom in self.atoms})
+        cases = [(values, copy_body(body)) for values, body in self._cases]
         default = None if self.default is None else copy_body(self.default)
-        return self._from_cases(source, cases, default)
+        return self._from_parts(expression, target, cases, default)
 
     @property
     def raw(self) -> dict:
         raise_error(
             NotImplementedError,
-            "A ``Condition`` refers to a measurement of its circuit, so it can only "
+            "A ``Condition`` refers to measurements of its circuit, so it can only "
             + "be serialized together with it using ``Circuit.raw``.",
         )
 
     def _serialize(self, measurements: list) -> dict:
-        """Serializes the condition referring to its measurement by position.
+        """Serializes the condition referring to measurements by position.
 
         Args:
             measurements (list): measurement gates that precede the condition
                 in the circuit, in order.
         """
-        index = _find_measurement(measurements, self.result)
-        if index is None:
-            raise_error(
-                ValueError,
-                "Cannot serialize a ``Condition`` whose measurement is not "
-                + "performed before it in the circuit.",
-            )
+
+        def reference(result):
+            index = _find_measurement(measurements, result)
+            if index is None:
+                raise_error(
+                    ValueError,
+                    "Cannot serialize a ``Condition`` whose measurement is not "
+                    + "performed before it in the circuit.",
+                )
+            return index
 
         def serialize_body(body):
             return [
@@ -323,23 +303,22 @@ class Condition(Gate):
                 for g in body
             ]
 
-        return {
-            "_class": "Condition",
-            "name": self.name,
-            "source": {"measurement": index, "bit": self.bit},
-            "cases": [
+        raw = {"_class": "Condition", "name": self.name}
+        if self.target is None:
+            raw["condition"] = _serialize_expression(self.expression, reference)
+            raw["body"] = serialize_body(self.body)
+        else:
+            raw["switch"] = _serialize_expression(self.target, reference)
+            raw["cases"] = [
                 {"values": list(values), "gates": serialize_body(body)}
-                for values, body in self.cases
-            ],
-            "default": None if self.default is None else serialize_body(self.default),
-        }
+                for values, body in self._cases
+            ]
+        raw["default"] = None if self.default is None else serialize_body(self.default)
+        return raw
 
     @classmethod
     def _deserialize(cls, raw: dict, measurements: list) -> "Condition":
         """Counter-part of :meth:`_serialize`."""
-        result = measurements[raw["source"]["measurement"]].result
-        bit = raw["source"]["bit"]
-        source = result if bit is None else result.symbols[bit]
 
         def deserialize_body(body):
             return [
@@ -351,13 +330,19 @@ class Condition(Gate):
                 for g in body
             ]
 
-        cases = [
-            (tuple(case["values"]), deserialize_body(case["gates"]))
-            for case in raw["cases"]
-        ]
         default = raw["default"]
         default = None if default is None else deserialize_body(default)
-        return cls._from_cases(source, cases, default)
+        if "switch" in raw:
+            target = _deserialize_expression(raw["switch"], measurements)
+            cases = [
+                (tuple(case["values"]), deserialize_body(case["gates"]))
+                for case in raw["cases"]
+            ]
+            return cls._from_parts(None, target, cases, default)
+        expression = _deserialize_expression(raw["condition"], measurements)
+        return cls._from_parts(
+            expression, None, [((), deserialize_body(raw["body"]))], default
+        )
 
     @property
     def qasm_label(self):
@@ -392,6 +377,72 @@ class Condition(Gate):
         return self.apply(backend, state, nqubits)
 
 
+def _expression(condition):
+    """Validates the boolean expression of a condition."""
+    if isinstance(condition, MeasurementResult):
+        condition = condition._bit()
+    if isinstance(condition, bool):
+        raise_error(
+            TypeError,
+            "The condition is a Python ``bool``. Comparing a single bit with ``==``, "
+            + "as in ``result[0] == 1``, does not build a condition: use "
+            + "``result[0]`` or ``~result[0]``, or compare a whole result, as in "
+            + "``result == 1``.",
+        )
+    if not isinstance(condition, Boolean) or isinstance(condition, Relational):
+        raise_error(
+            TypeError,
+            "A condition must be a measured bit or a boolean expression of measured "
+            + f"bits and register comparisons, but got {condition!r}.",
+        )
+    if condition.atoms(Relational):
+        raise_error(
+            TypeError,
+            "Conditions cannot contain sympy relations such as ``Eq``. Use measured "
+            + "bits, ``~`` for their negation, and ``result == value``.",
+        )
+    atoms = condition.free_symbols
+    if not atoms:
+        raise_error(
+            ValueError,
+            f"The condition is always {condition}, so it does not depend on any "
+            + "measurement.",
+        )
+    for atom in atoms:
+        if not isinstance(atom, (MeasurementSymbol, MeasurementValue)):
+            raise_error(
+                TypeError,
+                f"Conditions can only depend on measurement outcomes, but {atom} is not one.",
+            )
+    return condition
+
+
+def _switch_target(target):
+    if not isinstance(target, (MeasurementResult, MeasurementSymbol)):
+        raise_error(
+            TypeError,
+            "The target of a ``switch`` must be a measurement result or one of its "
+            + f"bits, but is {type(target)}.",
+        )
+    return target
+
+
+def _nbits(target) -> int:
+    """Number of bits of a ``switch`` target."""
+    if isinstance(target, MeasurementResult):
+        return len(target.target_qubits)
+    return 1
+
+
+def _case_values(values, nbits: int) -> tuple[int, ...]:
+    """Values of a ``switch`` case, as a tuple of integers in qibo's bit ordering."""
+    if isinstance(values, (list, tuple, set, frozenset)):
+        if not values:
+            raise_error(ValueError, "A case of a ``switch`` needs at least one value.")
+        return tuple(parse_outcome(value, nbits) for value in values)
+    return (parse_outcome(values, nbits),)
+
+
 def _body(body) -> list:
     """List of gates of a conditional branch.
 
@@ -403,11 +454,55 @@ def _body(body) -> list:
         return [body]
     if isinstance(body, Circuit):
         return list(body.queue)
-    if isinstance(body, (str, bytes)) or not hasattr(body, "__iter__"):
+    if isinstance(body, (str, bytes, dict)) or not hasattr(body, "__iter__"):
         raise_error(
             TypeError, f"Conditional operations must be gates, not {type(body)}."
         )
     return [gate for item in body for gate in _body(item)]
+
+
+def _atom_order(atom) -> tuple:
+    """Order of creation of measurement symbols and register comparisons."""
+    return (isinstance(atom, MeasurementValue), int(atom.name[1:]))
+
+
+def _rebuild_atom(atom, result: MeasurementResult):
+    """The same bit, comparison or register as ``atom``, for another result."""
+    if isinstance(atom, MeasurementResult):
+        return result
+    if isinstance(atom, MeasurementSymbol):
+        return result[atom.index]
+    return result == atom.value
+
+
+def _serialize_expression(expression, reference) -> dict:
+    """JSON-compatible form of a condition, with measurements given by position."""
+    if isinstance(expression, MeasurementResult):
+        return {"register": reference(expression)}
+    if isinstance(expression, MeasurementSymbol):
+        return {"bit": [reference(expression.result), expression.index]}
+    if isinstance(expression, MeasurementValue):
+        return {"equals": [reference(expression.result), expression.value]}
+    for operation, name in ((Not, "not"), (And, "and"), (Or, "or"), (Xor, "xor")):
+        if isinstance(expression, operation):
+            return {
+                name: [_serialize_expression(arg, reference) for arg in expression.args]
+            }
+    return _serialize_expression(to_nnf(expression, simplify=False), reference)
+
+
+def _deserialize_expression(raw: dict, measurements: list):
+    """Counter-part of :func:`_serialize_expression`."""
+    (name, value), *_ = raw.items()
+    if name == "register":
+        return measurements[value].result
+    if name == "bit":
+        return measurements[value[0]].result[value[1]]
+    if name == "equals":
+        return measurements[value[0]].result == value[1]
+    args = [_deserialize_expression(arg, measurements) for arg in value]
+    operations = {"not": Not, "and": And, "or": Or, "xor": Xor}
+    return operations[name](*args)
 
 
 def _find_measurement(measurements: list, result: MeasurementResult) -> int | None:

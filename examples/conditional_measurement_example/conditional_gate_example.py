@@ -6,37 +6,37 @@ converted to OpenQASM 3 and, if Qiskit is installed, executed with Qiskit Aer.
 
 from qibo import Circuit, gates
 
-circuit = Circuit(3)
-circuit.add(gates.H(0))
-circuit.add(gates.H(1))
+circuit = Circuit(4)
+circuit.add([gates.H(0), gates.H(1), gates.H(2)])
 
-# mid-circuit measurement of qubit 0, its outcome is ``bit.symbols[0]``
-bit = circuit.add(gates.M(0, collapse=True))
+# mid-circuit measurements: a single qubit is a bit, several qubits a register
+first = circuit.add(gates.M(0, collapse=True))
+register = circuit.add(gates.M(1, 2, collapse=True))
+
 # active reset: flip qubit 0 back to |0> if it was measured in |1>
-circuit.add(gates.Condition(bit.symbols[0], 1, gates.X(0)))
-# if/else with several gates per branch
+circuit.add(gates.Condition(first, gates.X(0)))
+# boolean expression of bits, with several gates and an else branch
 circuit.add(
-    gates.Condition(bit.symbols[0], 0, [gates.H(2), gates.S(2)], default=gates.X(2))
+    gates.Condition(first & ~register[1], [gates.H(3), gates.S(3)], default=gates.X(3))
 )
-
-# switch on the outcome of a two-qubit measurement: register values use
-# qibo's bit order, where ``register.symbols[0]`` is the most significant bit
-register = circuit.add(gates.M(0, 1, collapse=True))
+# comparison of a register: qibo's bit order, register[0] is the most significant
+circuit.add(gates.Condition(register != "01", gates.Z(3)))
+# switch on the value of a register; a tuple of values shares the gates
 circuit.add(
     gates.Condition(
         register,
-        {0: gates.Z(2), (1, "10"): [gates.H(2), gates.T(2)]},
-        default=gates.Y(2),
+        {0: gates.Z(3), (1, "10"): [gates.H(3), gates.T(3)]},
+        default=gates.Y(3),
     )
 )
-circuit.add(gates.M(0, 1, 2, register_name="result"))
+circuit.add(gates.M(0, 1, 2, 3, register_name="result"))
 
 circuit.draw()
 print()
 print(circuit.to_qasm3())
 print()
-# the same program with a ``switch`` statement and reused registers
-print(circuit.to_qasm3(switch_statement=True, reuse_registers=True))
+# the same program with OpenQASM 3 operators and switch statements
+print(circuit.to_qasm3(qiskit_compatible=False, reuse_registers=True))
 
 try:
     import qiskit.qasm3

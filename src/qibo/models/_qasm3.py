@@ -2,8 +2,12 @@
 
 import re
 
+import sympy
+from sympy.logic.boolalg import And, Not, Or, Xor, to_nnf
+
 from qibo import __version__, gates
 from qibo.config import raise_error
+from qibo.measurements import MeasurementResult, MeasurementSymbol, MeasurementValue
 
 # Gates of the OpenQASM 3 standard library ``stdgates.inc``.
 STDGATES = frozenset(
@@ -99,17 +103,18 @@ class QASM3Exporter:
         reuse_registers (bool): if ``True``, a mid-circuit measurement writes
             into the register of an earlier one of the same size whose value is
             no longer needed, instead of declaring a new register.
-        switch_statement (bool): if ``True``, conditions testing several values
-            are written as ``switch`` statements, otherwise as chains of
-            ``if``/``else if``/``else`` statements.
+        qiskit_compatible (bool): if ``True``, conditions only use the tests that
+            Qiskit's importer reads: single bits and comparisons of registers with
+            integers, in nested ``if``/``else`` statements. Otherwise they use the
+            OpenQASM 3 operators ``&&``, ``||``, ``!``, ``!=`` and ``switch``.
     """
 
     def __init__(
-        self, circuit, reuse_registers: bool = False, switch_statement: bool = False
+        self, circuit, reuse_registers: bool = False, qiskit_compatible: bool = True
     ):
         self.circuit = circuit
         self.reuse_registers = reuse_registers
-        self.switch_statement = switch_statement
+        self.qiskit_compatible = qiskit_compatible
         self.queue = list(circuit.queue)
         # custom gate definitions used by the program
         self.definitions = []
@@ -119,7 +124,8 @@ class QASM3Exporter:
     def _analyse(self):
         """Finds the mid-circuit measurements and what each condition reads."""
         latest = {}
-        # (position of a condition, id of a condition) -> position of its measurement
+        # (position of a condition, id of a condition) ->
+        #     {id of a result it reads: position of the measurement writing it}
         self.sources = {}
         # position of a measurement -> position of its last condition
         self.last_use = {}
@@ -128,15 +134,18 @@ class QASM3Exporter:
                 latest[id(gate.result)] = position
             elif isinstance(gate, gates.Condition):
                 for condition in gate._nested_conditions():
-                    source = latest.get(id(condition.result))
-                    if source is None:
-                        raise_error(
-                            ValueError,
-                            "A ``Condition`` depends on a measurement that is not "
-                            + "performed before it in the circuit.",
-                        )
-                    self.sources[(position, id(condition))] = source
-                    self.last_use[source] = position
+                    sources = {}
+                    for result in condition.results:
+                        source = latest.get(id(result))
+                        if source is None:
+                            raise_error(
+                                ValueError,
+                                "A ``Condition`` depends on a measurement that is "
+                                + "not performed before it in the circuit.",
+                            )
+                        sources[id(result)] = source
+                        self.last_use[source] = position
+                    self.sources[(position, id(condition))] = sources
 
         self.mid_circuit = [
             position
@@ -281,62 +290,191 @@ class QASM3Exporter:
 
     def _condition(self, condition, position: int, depth: int) -> list[str]:
         """Statements of a conditional block."""
-        source = self.sources[(position, id(condition))]
-        register = self.registers[source]
-        if condition.bit is not None:
-            register = f"{register}[{condition.bit}]"
-        if self.switch_statement and sum(map(len, (v for v, _ in condition.cases))) > 1:
+        sources = self.sources[(position, id(condition))]
+
+        def register(result):
+            return self.registers[sources[id(result)]]
+
+        if condition.target is not None:
             return self._switch(condition, register, position, depth)
 
+        # atoms are taken in the order the circuit measures them, comparisons of
+        # registers first because a single test checks several bits
+        def order(atom):
+            index = atom.index if isinstance(atom, MeasurementSymbol) else atom.value
+            return (
+                isinstance(atom, MeasurementSymbol),
+                sources[id(atom.result)],
+                index,
+            )
+
+        if not self.qiskit_compatible:
+            # operands are written in the order the circuit measures them
+            test = self._expression(
+                condition.expression, register, lambda atom: order(atom)[1:]
+            )
+            branches = [(test, condition.body)]
+            return self._chain(branches, condition.default, position, depth)
+
+        atoms = sorted(condition.atoms, key=order)
+        tree = _decision_tree(condition.expression, atoms)
+        return self._tree(tree, condition, register, position, depth)
+
+    def _tree(self, tree, condition, register, position: int, depth: int) -> list[str]:
+        """Statements of a decision tree at indentation ``depth``.
+
+        Leaves ``True`` and ``False`` stand for the body and the default branch.
+        """
+        if tree is True:
+            return self._statements(condition.body, position, depth)
+        if tree is False:
+            return self._statements(condition.default or [], position, depth)
+        indent = "  " * depth
+        lines = []
+        keyword = "if"
+        while isinstance(tree, tuple):
+            atom, high, low = tree
+            test = self._atom(atom, register)
+            if (
+                high is False
+                and low is not False
+                and isinstance(atom, MeasurementSymbol)
+            ):
+                # test the negated bit, so that the default branch comes last.
+                # Qiskit cannot read negated register comparisons, which keep an
+                # empty first branch instead
+                test, high, low = f"!{test}", low, high
+            lines.append(f"{indent}{keyword} ({test}) {{")
+            lines.extend(self._tree(high, condition, register, position, depth + 1))
+            keyword = "} else if"
+            tree = low
+        rest = self._tree(tree, condition, register, position, depth + 1)
+        if rest:
+            lines.append(f"{indent}}} else {{")
+            lines.extend(rest)
+        lines.append(f"{indent}}}")
+        return lines
+
+    def _atom(self, atom, register) -> str:
+        """Test of a measured bit or of the comparison of a register."""
+        if isinstance(atom, MeasurementSymbol):
+            return f"{register(atom.result)}[{atom.index}]"
+        nbits = len(atom.result.target_qubits)
+        return f"{register(atom.result)} == {_qasm_integer(atom.value, nbits)}"
+
+    def _expression(self, expression, register, order) -> str:
+        """A boolean expression written with OpenQASM 3 operators.
+
+        Operands are sorted by ``order`` of their first atom, so that the output
+        does not depend on how sympy sorts them.
+        """
+        if isinstance(expression, (MeasurementSymbol, MeasurementValue)):
+            return self._atom(expression, register)
+        if isinstance(expression, Not):
+            (arg,) = expression.args
+            if isinstance(arg, MeasurementValue):
+                return self._atom(arg, register).replace(" == ", " != ")
+            return "!" + self._operand(arg, register, order)
+        for operation, operator in ((And, " && "), (Or, " || "), (Xor, " != ")):
+            if isinstance(expression, operation):
+                args = sorted(
+                    expression.args,
+                    key=lambda arg: min(map(order, arg.free_symbols)),
+                )
+                return operator.join(
+                    self._operand(arg, register, order) for arg in args
+                )
+        return self._expression(to_nnf(expression, simplify=False), register, order)
+
+    def _operand(self, expression, register, order) -> str:
+        """An operand of an OpenQASM 3 operator, in parentheses unless it is a
+        bit or a negated bit."""
+        text = self._expression(expression, register, order)
+        if isinstance(expression, Not):
+            expression = expression.args[0]
+        if isinstance(expression, MeasurementSymbol):
+            return text
+        return f"({text})"
+
+    def _switch(self, condition, register, position: int, depth: int) -> list[str]:
+        """Statements of a condition that selects a body by value."""
+        target = condition.target
+        if isinstance(target, MeasurementResult):
+            name, nbits = register(target), len(target.target_qubits)
+        else:
+            name, nbits = f"{register(target.result)}[{target.index}]", 1
+        nvalues = sum(len(values) for values, _ in condition.cases)
+        if not self.qiskit_compatible and nvalues > 1:
+            indent = "  " * depth
+            lines = [f"{indent}switch (int({name})) {{"]
+            for values, body in condition.cases:
+                labels = ", ".join(str(_qasm_integer(v, nbits)) for v in values)
+                lines.append(f"{indent}  case {labels} {{")
+                lines.extend(self._statements(body, position, depth + 2))
+                lines.append(f"{indent}  }}")
+            if condition.default is not None:
+                lines.append(f"{indent}  default {{")
+                lines.extend(self._statements(condition.default, position, depth + 2))
+                lines.append(f"{indent}  }}")
+            lines.append(f"{indent}}}")
+            return lines
+
         def test(value):
-            if condition.bit is not None:
-                return register if value else f"!{register}"
-            return f"{register} == {_qasm_integer(value, condition.nbits)}"
+            if isinstance(target, MeasurementSymbol):
+                return name if value else f"!{name}"
+            return f"{name} == {_qasm_integer(value, nbits)}"
 
         # a case with several values repeats its body for each of them
         branches = [
             (test(value), body) for values, body in condition.cases for value in values
         ]
+        return self._chain(branches, condition.default, position, depth)
+
+    def _chain(self, branches, default, position: int, depth: int) -> list[str]:
+        """An ``if``/``else if``/``else`` chain of ``(test, body)`` branches."""
         indent = "  " * depth
         lines = []
-        for i, (expression, body) in enumerate(branches):
+        for i, (test, body) in enumerate(branches):
             keyword = "if" if i == 0 else "} else if"
-            lines.append(f"{indent}{keyword} ({expression}) {{")
-            lines.extend(self._block(body, position, depth))
-        if condition.default is not None:
+            lines.append(f"{indent}{keyword} ({test}) {{")
+            lines.extend(self._statements(body, position, depth + 1))
+        if default is not None:
             lines.append(f"{indent}}} else {{")
-            lines.extend(self._block(condition.default, position, depth))
+            lines.extend(self._statements(default, position, depth + 1))
         lines.append(f"{indent}}}")
         return lines
 
-    def _switch(self, condition, register: str, position: int, depth: int) -> list[str]:
-        """Statements of a condition written as a ``switch`` statement."""
+    def _statements(self, body: list, position: int, depth: int) -> list[str]:
+        """Statements of the gates of a conditional branch at indentation ``depth``."""
         indent = "  " * depth
-        lines = [f"{indent}switch (int({register})) {{"]
-        for values, body in condition.cases:
-            labels = ", ".join(
-                str(_qasm_integer(value, condition.nbits)) for value in values
-            )
-            lines.append(f"{indent}  case {labels} {{")
-            lines.extend(self._block(body, position, depth + 1))
-            lines.append(f"{indent}  }}")
-        if condition.default is not None:
-            lines.append(f"{indent}  default {{")
-            lines.extend(self._block(condition.default, position, depth + 1))
-            lines.append(f"{indent}  }}")
-        lines.append(f"{indent}}}")
-        return lines
-
-    def _block(self, body: list, position: int, depth: int) -> list[str]:
-        """Indented statements of the gates in a conditional branch."""
-        indent = "  " * (depth + 1)
         lines = []
         for gate in body:
             if isinstance(gate, gates.Condition):
-                lines.extend(self._condition(gate, position, depth + 1))
+                lines.extend(self._condition(gate, position, depth))
             else:
                 lines.extend(indent + line for line in self._gate(gate))
         return lines
+
+
+def _decision_tree(expression, atoms: list):
+    """Shannon expansion of a boolean expression over ``atoms``.
+
+    Returns ``True``, ``False`` or a tuple ``(atom, tree if true, tree if false)``.
+    Atoms the expression does not depend on are skipped.
+    """
+    for i, atom in enumerate(atoms):
+        if expression in (sympy.true, sympy.false):
+            break
+        if atom not in expression.free_symbols:
+            continue
+        high = expression.subs(atom, sympy.true)
+        low = expression.subs(atom, sympy.false)
+        if high == low:
+            expression = high
+            continue
+        rest = atoms[i + 1 :]
+        return (atom, _decision_tree(high, rest), _decision_tree(low, rest))
+    return expression == sympy.true
 
 
 def _check_identifier(name: str) -> str:

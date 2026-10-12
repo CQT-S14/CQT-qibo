@@ -116,7 +116,8 @@ class _Queue(list):
             idx = max(moment_index[q] for q in qubits)
             if isinstance(gate, gates.Condition):
                 for condition in gate._nested_conditions():
-                    idx = max(idx, measured.get(id(condition.result), 0))
+                    for result in condition.results:
+                        idx = max(idx, measured.get(id(result), 0))
             for q in qubits:
                 if idx >= len(moments):
                     # Add a moment
@@ -733,12 +734,14 @@ class Circuit:
         """Updates the circuit bookkeeping after adding a ``Condition``."""
         # a measurement whose outcome is used later in the circuit is a
         # mid-circuit measurement, as when a later gate acts on its qubits
-        for nested in condition._nested_conditions():
-            for measurement in list(self.measurements):
-                if measurement.result is nested.result:
-                    measurement.collapse = True
-                    self.has_collapse = True
-                    self.measurements.remove(measurement)
+        results = [
+            r for nested in condition._nested_conditions() for r in nested.results
+        ]
+        for measurement in list(self.measurements):
+            if any(measurement.result is result for result in results):
+                measurement.collapse = True
+                self.has_collapse = True
+                self.measurements.remove(measurement)
         # conditional gates can be updated with ``set_parameters``
         for gate in condition._nested_gates():
             if isinstance(gate, gates.ParametrizedGate):
@@ -1280,7 +1283,7 @@ class Circuit:
         return "\n".join(code)
 
     def to_qasm3(
-        self, reuse_registers: bool = False, switch_statement: bool = False
+        self, reuse_registers: bool = False, qiskit_compatible: bool = True
     ) -> str:
         """Convert circuit to an OpenQASM 3 string.
 
@@ -1300,11 +1303,14 @@ class Circuit:
                 writes into the register of an earlier mid-circuit measurement of
                 the same size whose outcome is not used by any later condition,
                 instead of declaring a new register. Defaults to ``False``.
-            switch_statement (bool, optional): if ``True``, conditions with several
-                values are written as OpenQASM 3 ``switch`` statements. Otherwise
-                they are written as ``if``/``else if``/``else`` chains, which,
-                unlike ``switch``, can be read by Qiskit's OpenQASM 3 importer.
-                Defaults to ``False``.
+            qiskit_compatible (bool, optional): if ``True``, conditions only use
+                the tests that Qiskit's OpenQASM 3 importer can read: single bits
+                and comparisons of whole registers with integers. Boolean
+                expressions become nested ``if``/``else`` statements, in which a
+                body may be repeated, and conditions with several values become
+                ``if``/``else if``/``else`` chains. If ``False``, conditions are
+                written with the OpenQASM 3 operators ``&&``, ``||``, ``!``, ``!=``
+                and ``switch`` statements. Defaults to ``True``.
 
         Returns:
             str: The generated OpenQASM 3 program.
@@ -1317,7 +1323,7 @@ class Circuit:
         from qibo.models._qasm3 import QASM3Exporter
 
         return QASM3Exporter(
-            self, reuse_registers=reuse_registers, switch_statement=switch_statement
+            self, reuse_registers=reuse_registers, qiskit_compatible=qiskit_compatible
         ).dumps()
 
     def to_qasm_file(
@@ -1533,10 +1539,7 @@ class Circuit:
         matrix, idx = self._update_draw_matrix(
             matrix, idx, condition, f"{condition.draw_label}["
         )
-        bodies = [body for _, body in condition.cases]
-        if condition.default is not None:
-            bodies.append(condition.default)
-        for i, body in enumerate(bodies):
+        for i, body in enumerate(condition.branches):
             if i > 0:
                 matrix, idx = self._update_draw_matrix(matrix, idx, condition, "][")
             for subgate in body:
@@ -1567,8 +1570,9 @@ class Circuit:
             elif isinstance(gate, gates.Condition):
                 # draw the condition after the measurements it depends on
                 start = max(
-                    measured.get(id(condition.result), 0)
+                    measured.get(id(result), 0)
                     for condition in gate._nested_conditions()
+                    for result in condition.results
                 )
                 for q in gate.qubits:
                     idx[q] = max(idx[q], start)
@@ -1727,9 +1731,10 @@ def _condition_measured_qubits(queue: list) -> dict:
         elif isinstance(gate, gates.Condition):
             qubits = measured.setdefault(id(gate), set())
             for condition in gate._nested_conditions():
-                measurement = latest.get(id(condition.result))
-                if measurement is not None:
-                    qubits.update(measurement.qubits)
+                for result in condition.results:
+                    measurement = latest.get(id(result))
+                    if measurement is not None:
+                        qubits.update(measurement.qubits)
     return measured
 
 
