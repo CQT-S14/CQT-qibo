@@ -1,6 +1,8 @@
 """Tests for classically conditioned gates, :class:`qibo.gates.Condition`."""
 
+import copy
 import json
+import pickle
 
 import numpy as np
 import pytest
@@ -274,6 +276,31 @@ def test_condition_raw_roundtrip():
         _ = circuit.queue[5].raw
 
 
+@pytest.mark.parametrize("method", ["pickle", "deepcopy"])
+def test_condition_pickle_and_deepcopy(method):
+    """Copied symbols keep their names, but must stay linked to the copied
+    measurements instead of being confused with the original ones."""
+    circuit = expression_circuit()
+    if method == "pickle":
+        new = pickle.loads(pickle.dumps(circuit))
+    else:
+        new = copy.deepcopy(circuit)
+    assert new.queue[5].results == [new.queue[3].result, new.queue[4].result]
+    assert [atom.name for atom in new.queue[5].atoms] == [
+        atom.name for atom in circuit.queue[5].atoms
+    ]
+    assert new.to_qasm3() == circuit.to_qasm3()
+
+
+def test_measurement_symbols_are_distinct():
+    result = Circuit(1).add(gates.M(0, collapse=True))
+    copied = pickle.loads(pickle.dumps(result[0]))
+    assert copied.name == result[0].name
+    assert copied != result[0]
+    # each symbol is still found in sympy expressions that contain it
+    assert (copied & result[0]).subs(copied, True) == result[0]
+
+
 def test_condition_raw_unresolved():
     result = Circuit(1).add(gates.M(0, collapse=True))
     circuit = Circuit(1)
@@ -359,6 +386,11 @@ def test_condition_body_circuit_with_measurement():
     body.add(gates.M(1))
     with pytest.raises(NotImplementedError):
         gates.Condition(result, body)
+
+
+def test_condition_empty_default():
+    result = Circuit(2).add(gates.M(0, collapse=True))
+    assert gates.Condition(result, gates.X(1), default=[]).default is None
 
 
 def test_condition_if_else():

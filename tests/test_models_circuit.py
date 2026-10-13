@@ -530,10 +530,10 @@ def test_circuit_decompose_keeps_measurement_results():
 
     circuit = Circuit(2)
     result = circuit.add(gates.M(0, collapse=True))
-    circuit.add(gates.Condition(result, 1, gates.SX(1)))
+    circuit.add(gates.Condition(result, gates.SX(1)))
     decomposed = circuit.decompose()
     assert decomposed.queue[0].result is not result
-    assert decomposed.queue[1].result is decomposed.queue[0].result
+    assert decomposed.queue[1].results == [decomposed.queue[0].result]
     assert result.circuit is circuit
 
 

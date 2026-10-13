@@ -97,7 +97,10 @@ class Condition(Gate):
                 + "``Condition(result == value, gates)`` instead of "
                 + "``Condition(result, value, gates)``.",
             )
-        default = None if default is None else _body(default)
+        # an empty default branch is the same as no default branch
+        default = _body(default) if default is not None else None
+        if not default:
+            default = None
         if isinstance(body, dict):
             target = _switch_target(condition)
             nbits = _nbits(target)
@@ -386,8 +389,8 @@ def _expression(condition):
             TypeError,
             "The condition is a Python ``bool``. Comparing a single bit with ``==``, "
             + "as in ``result[0] == 1``, does not build a condition: use "
-            + "``result[0]`` or ``~result[0]``, or compare a whole result, as in "
-            + "``result == 1``.",
+            + "``result[0]`` or ``~result[0]``. Results build conditions only when "
+            + "compared with integers or bitstrings, as in ``result == 1``.",
         )
     if not isinstance(condition, Boolean) or isinstance(condition, Relational):
         raise_error(

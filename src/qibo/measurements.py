@@ -57,6 +57,12 @@ class MeasurementSymbol(sympy.Symbol):
         self.result = data.get("result")
         self.name = data.get("name")
 
+    def _hashable_content(self):
+        # copies made by ``pickle`` or ``copy.deepcopy`` keep the name of the
+        # symbol, but refer to other measurement results, so sympy (and its
+        # caches) must not consider them equal to the original
+        return super()._hashable_content() + (id(self),)
+
     def outcome(self):
         return self.result.samples(binary=True)[-1][self.index]
 
@@ -96,6 +102,10 @@ class MeasurementValue(sympy.Symbol):
         self.result = data.get("result")
         self.value = data.get("value")
         self.name = data.get("name")
+
+    def _hashable_content(self):
+        # see :meth:`MeasurementSymbol._hashable_content`
+        return super()._hashable_content() + (id(self),)
 
 
 def parse_outcome(value, nbits: int) -> int:
