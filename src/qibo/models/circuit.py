@@ -1308,7 +1308,7 @@ class Circuit:
                 and comparisons of whole registers with integers. Boolean
                 expressions become nested ``if``/``else`` statements, in which a
                 body may be repeated, and conditions with several values become
-                ``if``/``else if``/``else`` chains. If ``False``, conditions are
+                ``if``/``else if`` chains. If ``False``, conditions are
                 written with the OpenQASM 3 operators ``&&``, ``||``, ``!``, ``!=``
                 and ``switch`` statements. Defaults to ``True``.
 

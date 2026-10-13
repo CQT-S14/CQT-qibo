@@ -232,51 +232,40 @@ def test_qasm2_regressions():
     )
 
 
-def test_qasm3_if_else():
+def test_qasm3_several_gates():
     circuit = Circuit(2)
     result = circuit.add(gates.M(0, collapse=True))
-    circuit.add(gates.Condition(result, [gates.X(1), gates.H(0)], default=gates.Z(1)))
-    assert circuit.to_qasm3().endswith(
-        "if (register0[0]) {\n  x q[1];\n  h q[0];\n} else {\n  z q[1];\n}"
-    )
+    circuit.add(gates.Condition(result, [gates.X(1), gates.H(0)]))
+    assert circuit.to_qasm3().endswith("if (register0[0]) {\n  x q[1];\n  h q[0];\n}")
 
 
-def expression_circuit(build, default=False):
+def expression_circuit(build):
     circuit = Circuit(5)
     a = circuit.add(gates.M(0, collapse=True))
     b = circuit.add(gates.M(1, collapse=True))
     register = circuit.add(gates.M(2, 3, collapse=True))
-    default = gates.Z(4) if default else None
-    circuit.add(gates.Condition(build(a, b, register), gates.X(4), default=default))
+    circuit.add(gates.Condition(build(a, b, register), gates.X(4)))
     return circuit
 
 
 EXPRESSION_QASM = [
     (
         lambda a, b, r: a & ~b,
-        True,
-        (
-            "if (register0[0]) {\n"
-            "  if (!register1[0]) {\n"
-            "    x q[4];\n"
-            "  } else {\n"
-            "    z q[4];\n"
-            "  }\n"
-            "} else {\n"
-            "  z q[4];\n"
-            "}"
-        ),
-        "if (register0[0] && !register1[0]) {\n  x q[4];\n} else {\n  z q[4];\n}",
+        "if (register0[0]) {\n  if (!register1[0]) {\n    x q[4];\n  }\n}",
+        "if (register0[0] && !register1[0]) {\n  x q[4];\n}",
+    ),
+    (
+        lambda a, b, r: ~a & ~b,
+        "if (!register0[0]) {\n  if (!register1[0]) {\n    x q[4];\n  }\n}",
+        "if (!register0[0] && !register1[0]) {\n  x q[4];\n}",
     ),
     (
         lambda a, b, r: a | b,
-        False,
         "if (register0[0]) {\n  x q[4];\n} else if (register1[0]) {\n  x q[4];\n}",
         "if (register0[0] || register1[0]) {\n  x q[4];\n}",
     ),
     (
         lambda a, b, r: a ^ r[1],
-        False,
         (
             "if (register0[0]) {\n"
             "  if (!register2[1]) {\n"
@@ -290,34 +279,25 @@ EXPRESSION_QASM = [
     ),
     (
         lambda a, b, r: (r == 2) & a,
-        False,
         "if (register2 == 1) {\n  if (register0[0]) {\n    x q[4];\n  }\n}",
         "if (register0[0] && (register2 == 1)) {\n  x q[4];\n}",
     ),
     (
         lambda a, b, r: r != 0,
-        True,
-        "if (register2 == 0) {\n  z q[4];\n} else {\n  x q[4];\n}",
-        "if (register2 != 0) {\n  x q[4];\n} else {\n  z q[4];\n}",
-    ),
-    (
-        lambda a, b, r: r != 0,
-        False,
         "if (register2 == 0) {\n} else {\n  x q[4];\n}",
         "if (register2 != 0) {\n  x q[4];\n}",
     ),
     (
         lambda a, b, r: a | ~a,
-        False,
         "x q[4];",
         "if (register0[0] || !register0[0]) {\n  x q[4];\n}",
     ),
 ]
 
 
-@pytest.mark.parametrize("build,default,compatible,native", EXPRESSION_QASM)
-def test_qasm3_expressions(build, default, compatible, native):
-    circuit = expression_circuit(build, default)
+@pytest.mark.parametrize("build,compatible,native", EXPRESSION_QASM)
+def test_qasm3_expressions(build, compatible, native):
+    circuit = expression_circuit(build)
     qasm = circuit.to_qasm3()
     assert qasm.endswith("register2[1] = measure q[3];\n" + compatible)
     qasm = circuit.to_qasm3(qiskit_compatible=False)
@@ -325,42 +305,42 @@ def test_qasm3_expressions(build, default, compatible, native):
     parser.parse(qasm)
 
 
-def switch_circuit(default=True):
+def switch_circuit(values="integers"):
     circuit = Circuit(3)
     circuit.add(gates.H(0))
     circuit.add(gates.H(1))
     result = circuit.add(gates.M(0, 1, collapse=True))
-    circuit.add(
-        gates.Condition(
-            result,
-            {0: gates.X(2), (1, "10"): [gates.H(2), gates.T(2)]},
-            default=gates.Y(2) if default else None,
-        )
-    )
+    if values == "integers":
+        cases = {0: gates.X(2), (1, 2): [gates.H(2), gates.T(2)]}
+    else:
+        cases = {"00": gates.X(2), ("01", "10"): [gates.H(2), gates.T(2)]}
+    circuit.add(gates.Condition(result, cases))
     return circuit
 
 
-@pytest.mark.parametrize("default", [False, True])
-def test_qasm3_switch_as_if_chain(default):
-    qasm = switch_circuit(default).to_qasm3()
-    target = (
-        "if (register0 == 0) {\n"
-        "  x q[2];\n"
-        "} else if (register0 == 2) {\n"
-        "  h q[2];\n"
-        "  t q[2];\n"
-        "} else if (register0 == 1) {\n"
-        "  h q[2];\n"
-        "  t q[2];\n"
+@pytest.mark.parametrize("values", ["integers", "bitstrings"])
+def test_qasm3_switch_as_if_chain(values):
+    assert (
+        switch_circuit(values)
+        .to_qasm3()
+        .endswith(
+            "if (register0 == 0) {\n"
+            "  x q[2];\n"
+            "} else if (register0 == 2) {\n"
+            "  h q[2];\n"
+            "  t q[2];\n"
+            "} else if (register0 == 1) {\n"
+            "  h q[2];\n"
+            "  t q[2];\n"
+            "}"
+        )
     )
-    target += "} else {\n  y q[2];\n}" if default else "}"
-    assert qasm.endswith(target)
 
 
-@pytest.mark.parametrize("default", [False, True])
-def test_qasm3_switch_statement(default):
-    qasm = switch_circuit(default).to_qasm3(qiskit_compatible=False)
-    target = (
+@pytest.mark.parametrize("values", ["integers", "bitstrings"])
+def test_qasm3_switch_statement(values):
+    qasm = switch_circuit(values).to_qasm3(qiskit_compatible=False)
+    assert qasm.endswith(
         "switch (int(register0)) {\n"
         "  case 0 {\n"
         "    x q[2];\n"
@@ -369,9 +349,8 @@ def test_qasm3_switch_statement(default):
         "    h q[2];\n"
         "    t q[2];\n"
         "  }\n"
+        "}"
     )
-    target += "  default {\n    y q[2];\n  }\n}" if default else "}"
-    assert qasm.endswith(target)
     # valid according to the OpenQASM 3 reference parser
     parser.parse(qasm)
 
@@ -379,11 +358,11 @@ def test_qasm3_switch_statement(default):
 def test_qasm3_switch_on_bit():
     circuit = Circuit(2)
     result = circuit.add(gates.M(0, collapse=True))
-    circuit.add(gates.Condition(result[0], {1: gates.X(1)}, default=gates.Z(1)))
+    circuit.add(gates.Condition(result[0], {1: gates.X(1)}))
     circuit.add(gates.Condition(result[0], {0: gates.H(1), 1: gates.S(1)}))
     qasm = circuit.to_qasm3(qiskit_compatible=False)
     # a single value is written as ``if`` also without Qiskit compatibility
-    assert "if (register0[0]) {\n  x q[1];\n} else {\n  z q[1];\n}" in qasm
+    assert "if (register0[0]) {\n  x q[1];\n}" in qasm
     assert qasm.endswith(
         "switch (int(register0[0])) {\n"
         "  case 0 {\n    h q[1];\n  }\n"
@@ -400,14 +379,13 @@ def test_qasm3_nested_conditions():
     circuit = Circuit(3)
     first = circuit.add(gates.M(0, collapse=True))
     second = circuit.add(gates.M(1, collapse=True))
-    inner = gates.Condition(second, gates.X(2), default=gates.RY(2, 0.5))
+    inner = gates.Condition(second, [gates.X(2), gates.RY(2, 0.5)])
     circuit.add(gates.Condition(first, [gates.H(2), inner]))
     assert circuit.to_qasm3().endswith(
         "if (register0[0]) {\n"
         "  h q[2];\n"
         "  if (register1[0]) {\n"
         "    x q[2];\n"
-        "  } else {\n"
         "    ry(0.5) q[2];\n"
         "  }\n"
         "}"
@@ -592,12 +570,15 @@ def test_qiskit_switch(prepared):
     if prepared & 1:
         circuit.add(gates.X(1))
     result = circuit.add(gates.M(0, 1, collapse=True))
-    # 0 -> leave |0>, 1 or 2 -> |1>, otherwise (3) -> |1> then H Z H = X -> |0>
+    # 0 -> leave |0>, 1 or 2 -> |1>, 3 -> |1> then H Z H = X -> |0>
     circuit.add(
         gates.Condition(
             result,
-            {0: [], (1, 2): gates.X(2)},
-            default=[gates.X(2), gates.H(2), gates.Z(2), gates.H(2)],
+            {
+                0: [],
+                (1, 2): gates.X(2),
+                3: [gates.X(2), gates.H(2), gates.Z(2), gates.H(2)],
+            },
         )
     )
     circuit.add(gates.M(2))
@@ -605,7 +586,7 @@ def test_qiskit_switch(prepared):
     assert _qiskit_counts(circuit, shots=10) == {expected: 10}
 
 
-def test_qiskit_nested_and_if_else():
+def test_qiskit_nested():
     circuit = Circuit(4)
     circuit.add(gates.H(0))
     circuit.add(gates.H(1))
@@ -613,7 +594,8 @@ def test_qiskit_nested_and_if_else():
     second = circuit.add(gates.M(1, collapse=True))
     # qubit 2 = first AND second, qubit 3 = NOT first
     inner = gates.Condition(second, gates.X(2))
-    circuit.add(gates.Condition(first, inner, default=gates.X(3)))
+    circuit.add(gates.Condition(first, inner))
+    circuit.add(gates.Condition(~first, gates.X(3)))
     circuit.add(gates.M(0, 1, 2, 3))
     counts = _qiskit_counts(circuit)
     assert set(counts) == {"0001", "0101", "1000", "1110"}
@@ -632,7 +614,8 @@ QISKIT_EXPRESSIONS = {
 
 @pytest.mark.parametrize("name", QISKIT_EXPRESSIONS)
 def test_qiskit_expressions(name):
-    """For every outcome of four measured bits, exactly the right branch runs."""
+    """For every outcome of four measured bits, either the condition or its
+    negation applies its gates."""
     build = QISKIT_EXPRESSIONS[name]
     for outcome in range(16):
         bits = [(outcome >> k) & 1 for k in range(4)]
@@ -642,7 +625,8 @@ def test_qiskit_expressions(name):
         b = circuit.add(gates.M(1, collapse=True))
         register = circuit.add(gates.M(2, 3, collapse=True))
         expression = build(a, b, register)
-        circuit.add(gates.Condition(expression, gates.X(4), default=gates.X(5)))
+        circuit.add(gates.Condition(expression, gates.X(4)))
+        circuit.add(gates.Condition(~expression, gates.X(5)))
         circuit.add(gates.M(4, 5))
         # expected value of the condition for this outcome
         values = {

@@ -313,8 +313,7 @@ class QASM3Exporter:
             test = self._expression(
                 condition.expression, register, lambda atom: order(atom)[1:]
             )
-            branches = [(test, condition.body)]
-            return self._chain(branches, condition.default, position, depth)
+            return self._chain([(test, condition.body)], position, depth)
 
         atoms = sorted(condition.atoms, key=order)
         tree = _decision_tree(condition.expression, atoms)
@@ -323,12 +322,12 @@ class QASM3Exporter:
     def _tree(self, tree, condition, register, position: int, depth: int) -> list[str]:
         """Statements of a decision tree at indentation ``depth``.
 
-        Leaves ``True`` and ``False`` stand for the body and the default branch.
+        A leaf ``True`` stands for the body, a leaf ``False`` for no gates.
         """
         if tree is True:
             return self._statements(condition.body, position, depth)
         if tree is False:
-            return self._statements(condition.default or [], position, depth)
+            return []
         indent = "  " * depth
         lines = []
         keyword = "if"
@@ -340,7 +339,7 @@ class QASM3Exporter:
                 and low is not False
                 and isinstance(atom, MeasurementSymbol)
             ):
-                # test the negated bit, so that the default branch comes last.
+                # test the negated bit, so that the empty branch is not written.
                 # Qiskit cannot read negated register comparisons, which keep an
                 # empty first branch instead
                 test, high, low = f"!{test}", low, high
@@ -412,10 +411,6 @@ class QASM3Exporter:
                 lines.append(f"{indent}  case {labels} {{")
                 lines.extend(self._statements(body, position, depth + 2))
                 lines.append(f"{indent}  }}")
-            if condition.default is not None:
-                lines.append(f"{indent}  default {{")
-                lines.extend(self._statements(condition.default, position, depth + 2))
-                lines.append(f"{indent}  }}")
             lines.append(f"{indent}}}")
             return lines
 
@@ -428,19 +423,16 @@ class QASM3Exporter:
         branches = [
             (test(value), body) for values, body in condition.cases for value in values
         ]
-        return self._chain(branches, condition.default, position, depth)
+        return self._chain(branches, position, depth)
 
-    def _chain(self, branches, default, position: int, depth: int) -> list[str]:
-        """An ``if``/``else if``/``else`` chain of ``(test, body)`` branches."""
+    def _chain(self, branches, position: int, depth: int) -> list[str]:
+        """An ``if``/``else if`` chain of ``(test, body)`` branches."""
         indent = "  " * depth
         lines = []
         for i, (test, body) in enumerate(branches):
             keyword = "if" if i == 0 else "} else if"
             lines.append(f"{indent}{keyword} ({test}) {{")
             lines.extend(self._statements(body, position, depth + 1))
-        if default is not None:
-            lines.append(f"{indent}}} else {{")
-            lines.extend(self._statements(default, position, depth + 1))
         lines.append(f"{indent}}}")
         return lines
 

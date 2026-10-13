@@ -37,8 +37,9 @@ class Condition(Gate):
     ``result == "10"``) means that the first measured bit is 1 and the second is 0.
 
     If ``body`` is a dictionary, the condition is a ``switch``: ``condition`` is a
-    measured register or bit, and the body of the matching value is applied.
-    A tuple of values, as in ``{(1, 2): body}``, shares one body.
+    measured register or bit, and the body of the matching value is applied. The
+    values of a ``switch`` are either all integers or all bitstrings, and a tuple
+    of values, as in ``{(1, 2): body}``, shares one body.
 
     A body is a gate, a list of gates, a generator of gates such as
     :meth:`qibo.models.circuit.Circuit.on_qubits`, or a
@@ -59,20 +60,12 @@ class Condition(Gate):
             register = circuit.add(gates.M(1, 2, collapse=True))
             # flip qubit 3 if qubit 0 was measured in state 1
             circuit.add(gates.Condition(first, gates.X(3)))
-            # boolean expression, with an else branch
-            circuit.add(
-                gates.Condition(
-                    ~first & register[1], [gates.H(3), gates.S(3)], default=gates.Z(3)
-                )
-            )
+            # boolean expression, with several gates
+            circuit.add(gates.Condition(~first & register[1], [gates.H(3), gates.S(3)]))
             # comparison of a register
             circuit.add(gates.Condition(register == "10", gates.X(3)))
             # switch on the value of a register
-            circuit.add(
-                gates.Condition(
-                    register, {0: gates.X(3), (1, 2): gates.T(3)}, default=gates.Y(3)
-                )
-            )
+            circuit.add(gates.Condition(register, {0: gates.X(3), (1, 2): gates.T(3)}))
             circuit.add(gates.M(3))
             print(circuit.to_qasm3())
 
@@ -83,12 +76,9 @@ class Condition(Gate):
         body (:class:`qibo.gates.Gate` or list or :class:`qibo.models.circuit.Circuit` or dict):
             gates applied when the condition is true. For a ``switch``, a
             dictionary that maps values to bodies.
-        default (:class:`qibo.gates.Gate` or list or :class:`qibo.models.circuit.Circuit`, optional):
-            gates applied when the condition is false, or when no value of a
-            ``switch`` matches. Defaults to ``None``.
     """
 
-    def __init__(self, condition, body, default=None):
+    def __init__(self, condition, body):
         super().__init__()
         if isinstance(body, (Integral, str)):
             raise_error(
@@ -97,17 +87,24 @@ class Condition(Gate):
                 + "``Condition(result == value, gates)`` instead of "
                 + "``Condition(result, value, gates)``.",
             )
-        # an empty default branch is the same as no default branch
-        default = _body(default) if default is not None else None
-        if not default:
-            default = None
         if isinstance(body, dict):
             target = _switch_target(condition)
             nbits = _nbits(target)
+            raw_cases = [
+                (_case_values(values), case_body) for values, case_body in body.items()
+            ]
+            if not raw_cases:
+                raise_error(ValueError, "A ``switch`` needs at least one case.")
+            if len({isinstance(v, str) for values, _ in raw_cases for v in values}) > 1:
+                raise_error(
+                    TypeError,
+                    "The values of a ``switch`` must be all integers or all "
+                    + "bitstrings, not both.",
+                )
             cases = []
             seen = set()
-            for values, case_body in body.items():
-                values = _case_values(values, nbits)
+            for values, case_body in raw_cases:
+                values = tuple(parse_outcome(value, nbits) for value in values)
                 for value in values:
                     if value in seen:
                         raise_error(
@@ -116,27 +113,24 @@ class Condition(Gate):
                         )
                     seen.add(value)
                 cases.append((values, _body(case_body)))
-            if not cases:
-                raise_error(ValueError, "A ``switch`` needs at least one case.")
-            self._setup(None, target, cases, default)
+            self._setup(None, target, cases)
         else:
-            self._setup(_expression(condition), None, [((), _body(body))], default)
+            self._setup(_expression(condition), None, [((), _body(body))])
 
     @classmethod
-    def _from_parts(cls, expression, target, cases, default):
+    def _from_parts(cls, expression, target, cases):
         """Creates a condition from already validated parts."""
         gate = cls.__new__(cls)
         Gate.__init__(gate)
-        gate._setup(expression, target, cases, default)
+        gate._setup(expression, target, cases)
         return gate
 
-    def _setup(self, expression, target, cases, default):
+    def _setup(self, expression, target, cases):
         self.name = "condition"
         self.draw_label = "if" if target is None else "switch"
         self.expression = expression
         self.target = target
         self._cases = cases
-        self.default = default
         for gate in self.gates:
             if not isinstance(gate, Gate):
                 raise_error(
@@ -188,11 +182,8 @@ class Condition(Gate):
 
     @property
     def branches(self) -> list:
-        """Lists of gates of all branches, ending with the default one if given."""
-        branches = [body for _, body in self._cases]
-        if self.default is not None:
-            branches.append(self.default)
-        return branches
+        """Lists of gates of all branches."""
+        return [body for _, body in self._cases]
 
     @property
     def gates(self) -> list:
@@ -217,8 +208,7 @@ class Condition(Gate):
     def _map_bodies(self, func) -> "Condition":
         """New condition with the same test and ``func`` applied to each branch."""
         cases = [(values, func(body)) for values, body in self._cases]
-        default = None if self.default is None else func(self.default)
-        return self._from_parts(self.expression, self.target, cases, default)
+        return self._from_parts(self.expression, self.target, cases)
 
     def on_qubits(self, qubit_map: dict) -> "Condition":
         """Creates the same condition with its gates acting on different qubits.
@@ -271,8 +261,7 @@ class Condition(Gate):
         else:
             expression = expression.xreplace({atom: remap(atom) for atom in self.atoms})
         cases = [(values, copy_body(body)) for values, body in self._cases]
-        default = None if self.default is None else copy_body(self.default)
-        return self._from_parts(expression, target, cases, default)
+        return self._from_parts(expression, target, cases)
 
     @property
     def raw(self) -> dict:
@@ -316,7 +305,6 @@ class Condition(Gate):
                 {"values": list(values), "gates": serialize_body(body)}
                 for values, body in self._cases
             ]
-        raw["default"] = None if self.default is None else serialize_body(self.default)
         return raw
 
     @classmethod
@@ -333,19 +321,15 @@ class Condition(Gate):
                 for g in body
             ]
 
-        default = raw["default"]
-        default = None if default is None else deserialize_body(default)
         if "switch" in raw:
             target = _deserialize_expression(raw["switch"], measurements)
             cases = [
                 (tuple(case["values"]), deserialize_body(case["gates"]))
                 for case in raw["cases"]
             ]
-            return cls._from_parts(None, target, cases, default)
+            return cls._from_parts(None, target, cases)
         expression = _deserialize_expression(raw["condition"], measurements)
-        return cls._from_parts(
-            expression, None, [((), deserialize_body(raw["body"]))], default
-        )
+        return cls._from_parts(expression, None, [((), deserialize_body(raw["body"]))])
 
     @property
     def qasm_label(self):
@@ -437,13 +421,13 @@ def _nbits(target) -> int:
     return 1
 
 
-def _case_values(values, nbits: int) -> tuple[int, ...]:
-    """Values of a ``switch`` case, as a tuple of integers in qibo's bit ordering."""
-    if isinstance(values, (list, tuple, set, frozenset)):
+def _case_values(values) -> tuple:
+    """Values of a ``switch`` case, as given: a single value or a tuple of values."""
+    if isinstance(values, (tuple, frozenset)):
         if not values:
             raise_error(ValueError, "A case of a ``switch`` needs at least one value.")
-        return tuple(parse_outcome(value, nbits) for value in values)
-    return (parse_outcome(values, nbits),)
+        return tuple(values)
+    return (values,)
 
 
 def _body(body) -> list:

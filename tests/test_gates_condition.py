@@ -143,8 +143,10 @@ def test_condition_invalid_expressions(build, error, match):
 
 def test_condition_former_value_argument():
     result = Circuit(2).add(gates.M(0, collapse=True))
-    with pytest.raises(TypeError, match="result == value"):
+    with pytest.raises(TypeError):
         gates.Condition(result[0], 1, gates.X(1))
+    with pytest.raises(TypeError, match="result == value"):
+        gates.Condition(result[0], 1)
 
 
 def test_condition_qubits():
@@ -253,11 +255,7 @@ def expression_circuit():
     circuit.add([gates.H(0), gates.H(1), gates.H(2)])
     a = circuit.add(gates.M(0, collapse=True))
     register = circuit.add(gates.M(1, 2, collapse=True))
-    circuit.add(
-        gates.Condition(
-            (register != 1) & ~a | (register[1] ^ a), gates.X(3), default=gates.Z(3)
-        )
-    )
+    circuit.add(gates.Condition((register != 1) & ~a | (register[1] ^ a), gates.X(3)))
     circuit.add(gates.M(3))
     return circuit
 
@@ -388,38 +386,47 @@ def test_condition_body_circuit_with_measurement():
         gates.Condition(result, body)
 
 
-def test_condition_empty_default():
+def test_condition_branches():
     result = Circuit(2).add(gates.M(0, collapse=True))
-    assert gates.Condition(result, gates.X(1), default=[]).default is None
-
-
-def test_condition_if_else():
-    result = Circuit(2).add(gates.M(0, collapse=True))
-    condition = gates.Condition(result, gates.X(1), default=[gates.H(1), gates.Z(0)])
-    assert names(condition.body) == [("X", (1,))]
-    assert names(condition.default) == [("H", (1,)), ("Z", (0,))]
-    assert condition.branches == [condition.body, condition.default]
+    condition = gates.Condition(result, [gates.X(1), gates.Z(0)])
+    assert names(condition.body) == [("X", (1,)), ("Z", (0,))]
+    assert condition.branches == [condition.body]
     assert condition.qubits == (0, 1)
+
+
+def test_condition_has_no_default():
+    result = Circuit(2).add(gates.M(0, collapse=True))
+    with pytest.raises(TypeError):
+        gates.Condition(result, gates.X(1), default=gates.Z(1))
 
 
 @pytest.mark.parametrize(
     "cases,expected",
     [
-        ({0: "x", (1, "10"): "ht"}, [((0,), "x"), ((1, 2), "ht")]),
+        ({0: "x", (1, 2): "ht"}, [((0,), "x"), ((1, 2), "ht")]),
         ({3: "x", np.int64(1): "ht"}, [((3,), "x"), ((1,), "ht")]),
-        ({"11": "x", (0, 2): "ht"}, [((3,), "x"), ((0, 2), "ht")]),
+        ({"11": "x", ("00", "10"): "ht"}, [((3,), "x"), ((0, 2), "ht")]),
     ],
 )
 def test_condition_switch(cases, expected):
     result = Circuit(3).add(gates.M(0, 1, collapse=True))
     bodies = {"x": [gates.X(2)], "ht": [gates.H(2), gates.T(2)]}
     cases = {values: bodies[body] for values, body in cases.items()}
-    condition = gates.Condition(result, cases, default=gates.Y(2))
+    condition = gates.Condition(result, cases)
     assert condition.target is result and condition.expression is None
     assert condition.cases == [(values, bodies[body]) for values, body in expected]
-    assert names(condition.default) == [("Y", (2,))]
+    assert condition.branches == [bodies[body] for _, body in expected]
     assert condition.draw_label == "switch"
     assert condition.results == [result]
+
+
+@pytest.mark.parametrize(
+    "cases", [{0: gates.X(2), "11": gates.Z(2)}, {(1, "10"): gates.X(2)}]
+)
+def test_condition_switch_values_of_one_kind(cases):
+    result = Circuit(3).add(gates.M(0, 1, collapse=True))
+    with pytest.raises(TypeError, match="all integers or all bitstrings"):
+        gates.Condition(result, cases)
 
 
 def test_condition_switch_on_bit():
@@ -458,7 +465,7 @@ def nested_circuit():
     circuit.add(gates.H(1))
     first = circuit.add(gates.M(0, collapse=True))
     second = circuit.add(gates.M(1, collapse=True))
-    inner = gates.Condition(second, gates.X(2), default=gates.RY(2, 0.3))
+    inner = gates.Condition(second, [gates.X(2), gates.RY(2, 0.3)])
     circuit.add(gates.Condition(first, [gates.H(2), inner]))
     circuit.add(gates.M(2))
     return circuit
@@ -474,11 +481,11 @@ def test_condition_nested():
     assert names(condition._nested_gates()) == [("H", (2,)), ("X", (2,)), ("RY", (2,))]
     # parameters of nested gates are registered
     circuit.set_parameters([0.7])
-    assert condition.gates[1].default[0].parameters == (0.7,)
+    assert condition.gates[1].body[1].parameters == (0.7,)
     assert circuit.diagram() == (
-        "0: ─H─M─────────────────────────\n"
-        "1: ─H─M─────────────────────────\n"
-        "2: ─────if[─H─if[─X─][─RY─]─]─M─"
+        "0: ─H─M──────────────────────\n"
+        "1: ─H─M──────────────────────\n"
+        "2: ─────if[─H─if[─X─RY─]─]─M─"
     )
 
 
@@ -501,7 +508,7 @@ def test_condition_switch_raw_roundtrip(target):
     circuit = Circuit(3)
     result = circuit.add(gates.M(0, 1, collapse=True))
     target = result if target == "register" else result[1]
-    circuit.add(gates.Condition(target, {0: gates.X(2), (1,): []}, default=gates.Y(2)))
+    circuit.add(gates.Condition(target, {0: gates.X(2), (1,): []}))
     raw = json.loads(json.dumps(circuit.raw))
     loaded = Circuit.from_dict(raw)
     assert loaded.queue[1].cases[1][0] == (1,)

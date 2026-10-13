@@ -533,10 +533,10 @@ bitstring, where ``output[0]`` is the most significant bit:
     # apply Z to qubit 3 if qubits 1 and 2 were measured in 1 and 0
     circuit.add(gates.Condition(register == "10", gates.Z(3)))
 
-The gates can be a single gate, a list of gates or a circuit. A ``default``
-branch is applied when the condition is false (``else``). With a dictionary
-instead of gates, a register or bit selects the gates of its value, like a
-``switch`` statement:
+The gates can be a single gate, a list of gates or a circuit. With a
+dictionary instead of gates, a register or bit selects the gates of its value,
+like a ``switch`` statement. The values are either all integers or all
+bitstrings, and a tuple of values shares the same gates:
 
 .. testcode::
 
@@ -545,12 +545,13 @@ instead of gates, a register or bit selects the gates of its value, like a
     circuit = Circuit(3)
     circuit.add([gates.H(0), gates.H(1)])
     output = circuit.add(gates.M(0, 1, collapse=True))
-    circuit.add(gates.Condition(output[1], gates.Z(2), default=gates.X(2)))
+    circuit.add(
+        gates.Condition(output, {0: gates.X(2), (1, 2): [gates.H(2), gates.S(2)]})
+    )
+    # the same cases written with bitstrings
     circuit.add(
         gates.Condition(
-            output,
-            {0: gates.X(2), (1, "10"): [gates.H(2), gates.S(2)]},
-            default=gates.Y(2),
+            output, {"00": gates.X(2), ("01", "10"): [gates.H(2), gates.S(2)]}
         )
     )
 
@@ -568,7 +569,7 @@ with Qiskit:
 
 By default, conditions only use the tests that Qiskit's importer can read:
 boolean expressions become nested ``if``/``else`` statements and a ``switch``
-becomes an ``if``/``else if``/``else`` chain.
+becomes an ``if``/``else if`` chain.
 ``circuit.to_qasm3(qiskit_compatible=False)`` writes them with the OpenQASM 3
 operators ``&&``, ``||``, ``!``, ``!=`` and ``switch`` statements instead.
 Programs with many mid-circuit measurements can reuse the classical registers
