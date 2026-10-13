@@ -517,6 +517,26 @@ def test_circuit_decompose(measurements):
         assert decomp_circuitircuit.measurement_tuples == {"register0": (0, 2)}
 
 
+def test_circuit_decompose_keeps_measurement_results():
+    """The results returned when adding measurements stay linked to the
+    original circuit, and conditions to the decomposed measurements."""
+    circuit = Circuit(2)
+    circuit.add(gates.H(0))
+    result = circuit.add(gates.M(0))
+    decomposed = circuit.decompose()
+    assert decomposed.queue[1].result is not result
+    circuit(nshots=10)
+    assert sum(result.frequencies().values()) == 10
+
+    circuit = Circuit(2)
+    result = circuit.add(gates.M(0, collapse=True))
+    circuit.add(gates.Condition(result, 1, gates.SX(1)))
+    decomposed = circuit.decompose()
+    assert decomposed.queue[0].result is not result
+    assert decomposed.queue[1].result is decomposed.queue[0].result
+    assert result.circuit is circuit
+
+
 @pytest.mark.parametrize("measurements", [False, True])
 @pytest.mark.parametrize(
     "noise_map",

@@ -545,12 +545,15 @@ class Circuit:
         # FIXME: This method is not completed until the ``decompose`` is
         # implemented for all gates not supported by OpenQASM.
         decomp_circuit = self.__class__(self.nqubits)
+        # maps old measurement results to the new ones, which conditions refer to
+        results = {}
         for gate in self.queue:
+            new_gates = gate.decompose(*free, method=method, **kwargs)
             if isinstance(gate, gates.M):
-                # keep the measurement result, which conditions refer to
-                decomp_circuit.add(gate.on_qubits({q: q for q in gate.qubits}))
-            else:
-                decomp_circuit.add(gate.decompose(*free, method=method, **kwargs))
+                results[id(gate.result)] = new_gates[0].result
+            elif isinstance(gate, gates.Condition):
+                new_gates = [condition._copy(results) for condition in new_gates]
+            decomp_circuit.add(new_gates)
         return decomp_circuit
 
     def with_pauli_noise(self, noise_map: NoiseMapType):
