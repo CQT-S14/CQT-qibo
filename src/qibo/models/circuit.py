@@ -87,7 +87,7 @@ class _Queue(list):
                 else:
                     queue.append(gate)
             elif isinstance(
-                gate.gates[0], (gates.SpecialGate, gates.M, gates.Condition)
+                gate.gates[0], (gates.SpecialGate, gates.M, gates.ControlFlowOp)
             ):
                 # special gates are marked by default so we need
                 # to add them manually
@@ -114,8 +114,8 @@ class _Queue(list):
 
             # calculate moment index for this gate
             idx = max(moment_index[q] for q in qubits)
-            if isinstance(gate, gates.Condition):
-                for condition in gate._nested_conditions():
+            if isinstance(gate, gates.ControlFlowOp):
+                for condition in gate._nested_control_flow():
                     for result in condition.results:
                         idx = max(idx, measured.get(id(result), 0))
             for q in qubits:
@@ -452,7 +452,7 @@ class Circuit:
                     new_gate = gate.__class__(*gate.init_args, **gate.init_kwargs)
                     results[id(gate.result)] = new_gate.result
                     new_circuit.add(new_gate)
-                elif isinstance(gate, gates.Condition):
+                elif isinstance(gate, gates.ControlFlowOp):
                     new_circuit.add(gate._copy(results))
                 else:
                     new_circuit.add(copy.copy(gate))
@@ -552,7 +552,7 @@ class Circuit:
             new_gates = gate.decompose(*free, method=method, **kwargs)
             if isinstance(gate, gates.M):
                 results[id(gate.result)] = new_gates[0].result
-            elif isinstance(gate, gates.Condition):
+            elif isinstance(gate, gates.ControlFlowOp):
                 new_gates = [condition._copy(results) for condition in new_gates]
             decomp_circuit.add(new_gates)
         return decomp_circuit
@@ -645,6 +645,9 @@ class Circuit:
             If the circuit contains measurement gates with ``collapse=True``
             a ``sympy.Symbol`` that parametrizes the corresponding outcome.
         """
+        if isinstance(gate, gates.IfChain):
+            gate._unfinished_error()
+
         if isinstance(gate, Iterable):
             for g in gate:
                 self.add(g)
@@ -667,6 +670,11 @@ class Circuit:
 
             if not isinstance(gate, gates.Gate):
                 raise_error(TypeError, f"Unknown gate type {type(gate)}.")
+
+            if isinstance(gate, gates.ControlFlowOp) and hasattr(
+                gate, "validate_complete"
+            ):
+                gate.validate_complete()
 
             if self._final_state is not None:
                 raise_error(
@@ -720,8 +728,8 @@ class Circuit:
                     self.has_collapse = True
                     self.measurements.remove(measurement)
 
-            if isinstance(gate, gates.Condition):
-                self._add_condition(gate)
+            if isinstance(gate, gates.ControlFlowOp):
+                self._add_control_flow(gate)
 
             if isinstance(gate, gates.UnitaryChannel):
                 self.has_unitary_channel = True
@@ -730,12 +738,12 @@ class Circuit:
                 if gate.trainable:
                     self.trainable_gates.append(gate)
 
-    def _add_condition(self, condition: "gates.Condition") -> None:
-        """Updates the circuit bookkeeping after adding a ``Condition``."""
+    def _add_control_flow(self, operation: "gates.ControlFlowOp") -> None:
+        """Updates bookkeeping after adding a classical control-flow operation."""
         # a measurement whose outcome is used later in the circuit is a
         # mid-circuit measurement, as when a later gate acts on its qubits
         results = [
-            r for nested in condition._nested_conditions() for r in nested.results
+            r for nested in operation._nested_control_flow() for r in nested.results
         ]
         for measurement in list(self.measurements):
             if any(measurement.result is result for result in results):
@@ -743,7 +751,7 @@ class Circuit:
                 self.has_collapse = True
                 self.measurements.remove(measurement)
         # conditional gates can be updated with ``set_parameters``
-        for gate in condition._nested_gates():
+        for gate in operation._nested_gates():
             if isinstance(gate, gates.ParametrizedGate):
                 self.parametrized_gates.append(gate)
                 if gate.trainable:
@@ -1130,11 +1138,11 @@ class Circuit:
             Either a ``qibo.result.QuantumState``, ``qibo.result.MeasurementOutcomes``
             or ``qibo.result.CircuitResult`` depending on the circuit's configuration.
         """
-        if any(isinstance(gate, gates.Condition) for gate in self.queue):
+        if any(isinstance(gate, gates.ControlFlowOp) for gate in self.queue):
             raise_error(
                 NotImplementedError,
-                "Simulation of ``Condition`` gates is not supported yet. "
-                + "Circuits with conditions can be exported with ``Circuit.to_qasm3``.",
+                "Native Qibo simulation of classical control flow is not implemented. "
+                + "Export the circuit with ``Circuit.to_qasm3``.",
             )
         if self.compiled:
             state = self.compiled.executor(initial_state, nshots)
@@ -1172,7 +1180,7 @@ class Circuit:
         # conditions refer to the measurements preceding them by position
         measurements = []
         for gate in self.queue:
-            if isinstance(gate, gates.Condition):
+            if isinstance(gate, gates.ControlFlowOp):
                 queue.append(gate._serialize(measurements))
             else:
                 queue.append(gate.raw)
@@ -1200,8 +1208,8 @@ class Circuit:
 
         measurements = []
         for raw_gate in raw["queue"]:
-            if raw_gate["_class"] == "Condition":
-                gate = gates.Condition._deserialize(raw_gate, measurements)
+            if raw_gate["_class"] in {"IfElse", "Switch"}:
+                gate = gates.ControlFlowOp._deserialize(raw_gate, measurements)
             else:
                 gate = Gate.from_dict(raw_gate)
             circuit.add(gate)
@@ -1289,7 +1297,7 @@ class Circuit:
 
         Besides the gates supported by :meth:`qibo.models.circuit.Circuit.to_qasm`,
         OpenQASM 3 supports mid-circuit measurements and gates applied
-        conditionally on their outcomes (:class:`qibo.gates.Condition`).
+        conditionally on their outcomes (:class:`qibo.gates.IfElse`).
 
         The program includes ``stdgates.inc``. Gates that are not part of it
         are written as custom gate definitions, named as in Qiskit when Qiskit
@@ -1532,9 +1540,9 @@ class Circuit:
         return matrix, idx
 
     def _draw_condition(
-        self, matrix: ArrayLike, idx: list[int], condition: "gates.Condition"
+        self, matrix: ArrayLike, idx: list[int], condition: "gates.ControlFlowOp"
     ) -> tuple[ArrayLike, list[int]]:
-        """Helper method for drawing a ``Condition`` with the gates of its
+        """Helper method for drawing a control-flow operation with the gates of its
         branches between brackets, separated by ``][``."""
         matrix, idx = self._update_draw_matrix(
             matrix, idx, condition, f"{condition.draw_label}["
@@ -1543,7 +1551,7 @@ class Circuit:
             if i > 0:
                 matrix, idx = self._update_draw_matrix(matrix, idx, condition, "][")
             for subgate in body:
-                if isinstance(subgate, gates.Condition):
+                if isinstance(subgate, gates.ControlFlowOp):
                     matrix, idx = self._draw_condition(matrix, idx, subgate)
                 else:
                     matrix, idx = self._update_draw_matrix(matrix, idx, subgate)
@@ -1567,11 +1575,11 @@ class Circuit:
                     matrix, idx = self._update_draw_matrix(matrix, idx, subgate)
                 # end fused gate
                 matrix, idx = self._update_draw_matrix(matrix, idx, gate, "]")
-            elif isinstance(gate, gates.Condition):
+            elif isinstance(gate, gates.ControlFlowOp):
                 # draw the condition after the measurements it depends on
                 start = max(
                     measured.get(id(result), 0)
-                    for condition in gate._nested_conditions()
+                    for condition in gate._nested_control_flow()
                     for result in condition.results
                 )
                 for q in gate.qubits:
@@ -1721,16 +1729,15 @@ def _resolve_qubits(
 
 
 def _condition_measured_qubits(queue: list) -> dict:
-    """Maps the ``id`` of each ``Condition`` in ``queue`` to the qubits of the
-    measurements it depends on."""
+    """Maps each control-flow operation to the qubits of its measurements."""
     latest = {}
     measured = {}
     for gate in queue:
         if isinstance(gate, gates.M):
             latest[id(gate.result)] = gate
-        elif isinstance(gate, gates.Condition):
+        elif isinstance(gate, gates.ControlFlowOp):
             qubits = measured.setdefault(id(gate), set())
-            for condition in gate._nested_conditions():
+            for condition in gate._nested_control_flow():
                 for result in condition.results:
                     measurement = latest.get(id(result))
                     if measurement is not None:

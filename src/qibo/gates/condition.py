@@ -1,8 +1,9 @@
-"""Gates applied conditionally on the outcome of mid-circuit measurements."""
+"""Classical control-flow operations driven by mid-circuit measurements."""
 
 import copy
-from numbers import Integral
+from collections.abc import Mapping
 
+import sympy
 from sympy.core.relational import Relational
 from sympy.logic.boolalg import And, Boolean, Not, Or, Xor, to_nnf
 
@@ -10,220 +11,81 @@ from qibo.config import raise_error
 from qibo.gates.abstract import Gate, SpecialGate
 from qibo.gates.measurements import M
 from qibo.measurements import (
+    MeasurementBit,
     MeasurementResult,
     MeasurementSymbol,
     MeasurementValue,
     parse_outcome,
 )
 
-__all__ = ["Condition"]
+__all__ = ["ControlFlowOp", "IfChain", "IfElse", "Switch"]
+
+_MISSING = object()
 
 
-class Condition(Gate):
-    """Applies gates only if mid-circuit measurements have given outcomes.
+class ControlFlowOp(Gate):
+    """Base class for classical control-flow operations.
 
-    The outcomes are referenced through the result returned when a measurement
-    is added to a circuit, ``result = circuit.add(gates.M(..., collapse=True))``:
-
-    - ``result[i]`` is the :math:`i`-th measured bit, which is true when it was
-      measured in state 1. A result of a single qubit is itself a bit;
-    - bits are combined with ``&`` (and), ``|`` (or), ``^`` (xor) and ``~`` (not);
-    - ``result == value`` and ``result != value`` compare the whole register with
-      an integer or a bitstring.
-
-    Register values follow qibo's bitstring convention: ``result[0]`` is the
-    most significant bit. For example, after
-    ``result = circuit.add(gates.M(0, 1, collapse=True))``, ``result == 2`` (or
-    ``result == "10"``) means that the first measured bit is 1 and the second is 0.
-
-    If ``body`` is a dictionary, the condition is a ``switch``: ``condition`` is a
-    measured register or bit, and the body of the matching value is applied. The
-    values of a ``switch`` are either all integers or all bitstrings, and a tuple
-    of values, as in ``{(1, 2): body}``, shares one body.
-
-    A body is a gate, a list of gates, a generator of gates such as
-    :meth:`qibo.models.circuit.Circuit.on_qubits`, or a
-    :class:`qibo.models.circuit.Circuit`, whose gates are used. Bodies may
-    contain other conditions, but not measurements.
-
-    Simulation of conditional gates is not supported yet. Circuits containing
-    them can be exported with :meth:`qibo.models.circuit.Circuit.to_qasm3`.
-
-    Example:
-        .. code-block:: python
-
-            from qibo import Circuit, gates
-
-            circuit = Circuit(4)
-            circuit.add([gates.H(0), gates.H(1), gates.H(2)])
-            first = circuit.add(gates.M(0, collapse=True))
-            register = circuit.add(gates.M(1, 2, collapse=True))
-            # flip qubit 3 if qubit 0 was measured in state 1
-            circuit.add(gates.Condition(first, gates.X(3)))
-            # boolean expression, with several gates
-            circuit.add(gates.Condition(~first & register[1], [gates.H(3), gates.S(3)]))
-            # comparison of a register
-            circuit.add(gates.Condition(register == "10", gates.X(3)))
-            # switch on the value of a register
-            circuit.add(gates.Condition(register, {0: gates.X(3), (1, 2): gates.T(3)}))
-            circuit.add(gates.M(3))
-            print(circuit.to_qasm3())
-
-    Args:
-        condition (:class:`qibo.measurements.MeasurementResult` or sympy.Basic):
-            boolean expression of measured bits and register comparisons. For a
-            ``switch``, the measured register or bit whose value selects the body.
-        body (:class:`qibo.gates.Gate` or list or :class:`qibo.models.circuit.Circuit` or dict):
-            gates applied when the condition is true. For a ``switch``, a
-            dictionary that maps values to bodies.
+    This is an implementation detail shared by :class:`IfElse` and
+    :class:`Switch`; users normally construct one of those concrete operations.
     """
 
-    def __init__(self, condition, body):
-        super().__init__()
-        if isinstance(body, (Integral, str)):
-            raise_error(
-                TypeError,
-                "Conditions are expressions of measurement outcomes: write "
-                + "``Condition(result == value, gates)`` instead of "
-                + "``Condition(result, value, gates)``.",
-            )
-        if isinstance(body, dict):
-            target = _switch_target(condition)
-            nbits = _nbits(target)
-            raw_cases = [
-                (_case_values(values), case_body) for values, case_body in body.items()
-            ]
-            if not raw_cases:
-                raise_error(ValueError, "A ``switch`` needs at least one case.")
-            if len({isinstance(v, str) for values, _ in raw_cases for v in values}) > 1:
-                raise_error(
-                    TypeError,
-                    "The values of a ``switch`` must be all integers or all "
-                    + "bitstrings, not both.",
-                )
-            cases = []
-            seen = set()
-            for values, case_body in raw_cases:
-                values = tuple(parse_outcome(value, nbits) for value in values)
-                for value in values:
-                    if value in seen:
-                        raise_error(
-                            ValueError,
-                            f"Value {value} is used by more than one case of the condition.",
-                        )
-                    seen.add(value)
-                cases.append((values, _body(case_body)))
-            self._setup(None, target, cases)
-        else:
-            self._setup(_expression(condition), None, [((), _body(body))])
-
-    @classmethod
-    def _from_parts(cls, expression, target, cases):
-        """Creates a condition from already validated parts."""
-        gate = cls.__new__(cls)
-        Gate.__init__(gate)
-        gate._setup(expression, target, cases)
-        return gate
-
-    def _setup(self, expression, target, cases):
-        self.name = "condition"
-        self.draw_label = "if" if target is None else "switch"
-        self.expression = expression
-        self.target = target
-        self._cases = cases
-        for gate in self.gates:
+    def _setup(self, name: str, draw_label: str, branches: list[list[Gate]]):
+        self.name = name
+        self.draw_label = draw_label
+        for gate in (gate for branch in branches for gate in branch):
             if not isinstance(gate, Gate):
                 raise_error(
                     TypeError,
-                    f"Conditional operations must be gates, not {type(gate)}.",
+                    "Conditional branch bodies must contain gates, but found "
+                    + f"{type(gate).__name__}.",
                 )
             if isinstance(gate, (M, SpecialGate)):
                 raise_error(
                     NotImplementedError,
-                    f"{gate.__class__.__name__} gates cannot be applied conditionally.",
+                    f"{gate.__class__.__name__} gates cannot be used inside "
+                    + "conditional branches.",
                 )
-        qubits = {q for gate in self.gates for q in gate.qubits}
+        qubits = {
+            qubit for branch in branches for gate in branch for qubit in gate.qubits
+        }
         if not qubits:
-            raise_error(ValueError, "A ``Condition`` needs at least one gate to apply.")
+            raise_error(
+                ValueError,
+                f"A {self.__class__.__name__} needs at least one gate across its branches.",
+            )
         self.target_qubits = tuple(sorted(qubits))
 
     @property
-    def body(self) -> list | None:
-        """Gates applied when the condition is true, ``None`` for a ``switch``."""
-        return self._cases[0][1] if self.target is None else None
-
-    @property
-    def cases(self) -> list | None:
-        """Pairs of values and bodies of a ``switch``, ``None`` otherwise.
-
-        Values are integers in qibo's bit ordering.
-        """
-        return None if self.target is None else self._cases
-
-    @property
-    def atoms(self) -> list:
-        """Measured bits and register comparisons in the condition.
-
-        For a ``switch``, the measured register or bit.
-        """
-        if self.target is not None:
-            return [self.target]
-        return sorted(self.expression.free_symbols, key=_atom_order)
-
-    @property
-    def results(self) -> list:
-        """Measurement results that the condition reads, without repetitions."""
-        results = []
-        for atom in self.atoms:
-            result = atom if isinstance(atom, MeasurementResult) else atom.result
-            if not any(result is other for other in results):
-                results.append(result)
-        return results
-
-    @property
-    def branches(self) -> list:
-        """Lists of gates of all branches."""
-        return [body for _, body in self._cases]
-
-    @property
-    def gates(self) -> list:
-        """All gates of all branches, without descending into nested conditions."""
+    def gates(self) -> list[Gate]:
+        """All direct child gates, without descending into nested control flow."""
         return [gate for branch in self.branches for gate in branch]
 
-    def _nested_conditions(self):
-        """Yields this condition and all conditions nested in its branches."""
+    def _nested_control_flow(self):
+        """Yields this operation and all control-flow operations nested in it."""
         yield self
         for gate in self.gates:
-            if isinstance(gate, Condition):
-                yield from gate._nested_conditions()
+            if isinstance(gate, ControlFlowOp):
+                yield from gate._nested_control_flow()
 
     def _nested_gates(self):
-        """Yields all non-conditional gates, descending into nested conditions."""
+        """Yields ordinary gates, descending into nested control flow."""
         for gate in self.gates:
-            if isinstance(gate, Condition):
+            if isinstance(gate, ControlFlowOp):
                 yield from gate._nested_gates()
             else:
                 yield gate
 
-    def _map_bodies(self, func) -> "Condition":
-        """New condition with the same test and ``func`` applied to each branch."""
-        cases = [(values, func(body)) for values, body in self._cases]
-        return self._from_parts(self.expression, self.target, cases)
-
-    def on_qubits(self, qubit_map: dict) -> "Condition":
-        """Creates the same condition with its gates acting on different qubits.
-
-        The measurements the condition depends on are not changed, so mapping a
-        whole circuit (for example with
-        :meth:`qibo.models.circuit.Circuit.on_qubits`) keeps conditions linked
-        to the mapped measurements.
-        """
-        return self._map_bodies(lambda body: [g.on_qubits(qubit_map) for g in body])
+    def on_qubits(self, qubit_map: dict) -> "ControlFlowOp":
+        """Copies this operation, remapping its branch gates to other qubits."""
+        return self._map_bodies(
+            lambda body: [gate.on_qubits(qubit_map) for gate in body]
+        )
 
     def decompose(
         self, *free, use_toffolis: bool = True, method: str = "standard", **kwargs
     ):
-        """Decomposes the conditional gates, keeping the condition."""
+        """Decomposes the gates in every branch while preserving control flow."""
 
         def decompose_body(body):
             return [
@@ -236,125 +98,75 @@ class Condition(Gate):
 
         return [self._map_bodies(decompose_body)]
 
-    def _copy(self, results: dict) -> "Condition":
-        """Copy whose gates are new objects and whose measurements are remapped.
-
-        Args:
-            results (dict): maps ``id`` of old measurement results to the new
-                :class:`qibo.measurements.MeasurementResult` objects.
-        """
-
-        def remap(atom):
-            old = atom if isinstance(atom, MeasurementResult) else atom.result
-            new = results.get(id(old), old)
-            return _rebuild_atom(atom, new)
-
-        def copy_body(body):
-            return [
-                g._copy(results) if isinstance(g, Condition) else copy.copy(g)
-                for g in body
-            ]
-
-        expression, target = self.expression, self.target
-        if target is not None:
-            target = remap(target)
-        else:
-            expression = expression.xreplace({atom: remap(atom) for atom in self.atoms})
-        cases = [(values, copy_body(body)) for values, body in self._cases]
-        return self._from_parts(expression, target, cases)
-
     @property
     def raw(self) -> dict:
         raise_error(
             NotImplementedError,
-            "A ``Condition`` refers to measurements of its circuit, so it can only "
-            + "be serialized together with it using ``Circuit.raw``.",
+            f"A {self.__class__.__name__} refers to measurements of its circuit, "
+            + "so it can only be serialized together with it using ``Circuit.raw``.",
         )
 
-    def _serialize(self, measurements: list) -> dict:
-        """Serializes the condition referring to measurements by position.
-
-        Args:
-            measurements (list): measurement gates that precede the condition
-                in the circuit, in order.
-        """
-
-        def reference(result):
-            index = _find_measurement(measurements, result)
-            if index is None:
-                raise_error(
-                    ValueError,
-                    "Cannot serialize a ``Condition`` whose measurement is not "
-                    + "performed before it in the circuit.",
-                )
-            return index
-
-        def serialize_body(body):
-            return [
-                g._serialize(measurements) if isinstance(g, Condition) else g.raw
-                for g in body
-            ]
-
-        raw = {"_class": "Condition", "name": self.name}
-        if self.target is None:
-            raw["condition"] = _serialize_expression(self.expression, reference)
-            raw["body"] = serialize_body(self.body)
-        else:
-            raw["switch"] = _serialize_expression(self.target, reference)
-            raw["cases"] = [
-                {"values": list(values), "gates": serialize_body(body)}
-                for values, body in self._cases
-            ]
-        return raw
-
     @classmethod
-    def _deserialize(cls, raw: dict, measurements: list) -> "Condition":
-        """Counter-part of :meth:`_serialize`."""
-
+    def _deserialize(cls, raw: dict, measurements: list) -> "ControlFlowOp":
         def deserialize_body(body):
             return [
                 (
-                    cls._deserialize(g, measurements)
-                    if g["_class"] == "Condition"
-                    else Gate.from_dict(g)
+                    ControlFlowOp._deserialize(gate, measurements)
+                    if gate["_class"] in {"IfElse", "Switch"}
+                    else Gate.from_dict(gate)
                 )
-                for g in body
+                for gate in body
             ]
 
-        if "switch" in raw:
-            target = _deserialize_expression(raw["switch"], measurements)
+        if raw["_class"] == "IfElse":
+            return IfElse(
+                _deserialize_expression(raw["condition"], measurements),
+                then_do=deserialize_body(raw["then_do"]),
+                else_do=deserialize_body(raw["else_do"]),
+            )
+        if raw["_class"] == "Switch":
+            target = _deserialize_expression(raw["target"], measurements)
             cases = [
-                (tuple(case["values"]), deserialize_body(case["gates"]))
+                (tuple(case["values"]), deserialize_body(case["do"]))
                 for case in raw["cases"]
             ]
-            return cls._from_parts(None, target, cases)
-        expression = _deserialize_expression(raw["condition"], measurements)
-        return cls._from_parts(expression, None, [((), deserialize_body(raw["body"]))])
+            return Switch._from_normalized(
+                target, cases, deserialize_body(raw["default_do"])
+            )
+        raise_error(ValueError, f"Unknown control-flow operation {raw['_class']!r}.")
 
     @property
     def qasm_label(self):
         raise_error(
             NotImplementedError,
-            "``Condition`` is only supported by OpenQASM 3, use ``Circuit.to_qasm3``.",
+            f"{self.__class__.__name__} is only supported by OpenQASM 3; use "
+            + "``Circuit.to_qasm3``.",
         )
 
     def controlled_by(self, *q):
-        raise_error(NotImplementedError, "``Condition`` gates cannot be controlled.")
+        raise_error(
+            NotImplementedError,
+            f"{self.__class__.__name__} operations cannot be quantum-controlled.",
+        )
 
     def _dagger(self):
-        raise_error(NotImplementedError, "``Condition`` gates cannot be inverted.")
+        raise_error(
+            NotImplementedError,
+            f"{self.__class__.__name__} operations cannot be inverted.",
+        )
 
     def matrix(self, backend=None):
         raise_error(
             NotImplementedError,
-            "``Condition`` gates do not have a matrix representation.",
+            f"{self.__class__.__name__} operations do not have a matrix representation.",
         )
 
     def apply(self, backend, state, nqubits):
         raise_error(
             NotImplementedError,
-            "Simulation of ``Condition`` gates is not supported yet. "
-            + "Circuits with conditions can be exported with ``Circuit.to_qasm3``.",
+            "Native Qibo simulation of classical control flow is not implemented. "
+            + "Export the circuit with ``Circuit.to_qasm3`` or inspect a selected "
+            + "branch with ``operation.select(classical_state)``.",
         )
 
     def apply_clifford(self, backend, state, nqubits):
@@ -364,36 +176,296 @@ class Condition(Gate):
         return self.apply(backend, state, nqubits)
 
 
+class IfElse(ControlFlowOp):
+    """Applies one of two gate bodies according to a measured condition.
+
+    Args:
+        condition: A measured bit or boolean expression of measured outcomes.
+        then_do: Gate, circuit, or iterable of gates applied when true.
+        else_do: Gate, circuit, or iterable of gates applied when false. Defaults
+            to an empty (no-op) branch.
+    """
+
+    def __init__(self, condition, then_do, else_do=()):
+        super().__init__()
+        self.expression = _expression(condition)
+        self.then_do = _body(then_do, "then_do")
+        self.else_do = _body(else_do, "else_do")
+        self._setup("ifelse", "if", self.branches)
+
+    @property
+    def branches(self) -> list[list[Gate]]:
+        return [self.then_do, self.else_do]
+
+    @property
+    def atoms(self) -> list:
+        return sorted(self.expression.free_symbols, key=_atom_order)
+
+    @property
+    def results(self) -> list[MeasurementResult]:
+        return _results(self.atoms)
+
+    def select(self, classical_state) -> list[Gate]:
+        """Returns the branch selected by ``classical_state`` without executing it."""
+        return (
+            self.then_do
+            if _evaluate(self.expression, classical_state)
+            else self.else_do
+        )
+
+    def _map_bodies(self, func) -> "IfElse":
+        return IfElse(self.expression, func(self.then_do), func(self.else_do))
+
+    def _copy(self, results: dict) -> "IfElse":
+        expression = _remap_expression(self.expression, results)
+        return IfElse(
+            expression,
+            _copy_body(self.then_do, results),
+            _copy_body(self.else_do, results),
+        )
+
+    def _serialize(self, measurements: list) -> dict:
+        reference = _measurement_reference(measurements, self.__class__.__name__)
+        return {
+            "_class": "IfElse",
+            "name": self.name,
+            "condition": _serialize_expression(self.expression, reference),
+            "then_do": _serialize_body(self.then_do, measurements),
+            "else_do": _serialize_body(self.else_do, measurements),
+        }
+
+
+class Switch(ControlFlowOp):
+    """Selects a gate body using the value of a measured bit or register.
+
+    Use the complete constructor ``Switch(target, cases, default_do=...)`` or
+    the fluent form ``Switch(target).case(...).default(...)``. The fluent form
+    deliberately requires ``default``; pass ``[]`` to acknowledge a no-op default.
+    """
+
+    def __init__(self, target, cases=None, default_do=_MISSING):
+        super().__init__()
+        self.target = _switch_target(target)
+        entries = _case_entries(cases)
+        self._value_kind = _case_kind(entries)
+        self._cases = _normalize_cases(self.target, entries)
+        self._default_do = (
+            _MISSING if default_do is _MISSING else _body(default_do, "default_do")
+        )
+        self.name = "switch"
+        self.draw_label = "switch"
+        self.target_qubits = ()
+        if cases is not None and default_do is _MISSING:
+            raise_error(
+                TypeError,
+                "Switch(target, cases=...) requires ``default_do``. Use "
+                + "``default_do=[]`` for an explicit no-op default.",
+            )
+        if self.complete:
+            self._finish_setup()
+
+    @classmethod
+    def _from_normalized(cls, target, cases, default_do) -> "Switch":
+        switch = cls.__new__(cls)
+        Gate.__init__(switch)
+        switch.target = _switch_target(target)
+        switch._cases = [(tuple(values), list(body)) for values, body in cases]
+        switch._value_kind = "integer"
+        switch._default_do = list(default_do)
+        switch._finish_setup()
+        return switch
+
+    def _finish_setup(self):
+        if not self._cases:
+            raise_error(
+                ValueError, "A Switch needs at least one case before its default."
+            )
+        self._setup("switch", "switch", self.branches)
+
+    @property
+    def complete(self) -> bool:
+        return self._default_do is not _MISSING
+
+    @property
+    def cases(self) -> list[tuple[tuple[int, ...], list[Gate]]]:
+        return self._cases
+
+    @property
+    def default_do(self) -> list[Gate]:
+        if not self.complete:
+            raise_error(
+                RuntimeError,
+                "This Switch builder is unfinished. Call ``.default(gates)``; "
+                + "use ``.default([])`` for a no-op default.",
+            )
+        return self._default_do
+
+    @property
+    def branches(self) -> list[list[Gate]]:
+        branches = [body for _, body in self._cases]
+        if self.complete:
+            branches.append(self._default_do)
+        return branches
+
+    @property
+    def atoms(self) -> list:
+        return [self.target]
+
+    @property
+    def results(self) -> list[MeasurementResult]:
+        return _results(self.atoms)
+
+    def case(self, values, do) -> "Switch":
+        """Returns a new builder with one additional case."""
+        if self.complete:
+            raise_error(
+                RuntimeError,
+                "Cannot add a case after ``Switch.default`` has completed the switch.",
+            )
+        raw_cases = list(self._cases)
+        entry = [(values, do)]
+        value_kind = _case_kind(entry)
+        if self._value_kind is not None and value_kind != self._value_kind:
+            raise_error(
+                TypeError,
+                "Switch case values must be all integers or all bitstrings, not a mixture.",
+            )
+        raw_cases.extend(_normalize_cases(self.target, entry))
+        _check_duplicate_cases(raw_cases)
+        switch = self.__class__.__new__(self.__class__)
+        Gate.__init__(switch)
+        switch.target = self.target
+        switch._cases = raw_cases
+        switch._value_kind = self._value_kind or value_kind
+        switch._default_do = _MISSING
+        return switch
+
+    def default(self, do) -> "Switch":
+        """Completes the builder with an explicit default branch."""
+        if self.complete:
+            raise_error(RuntimeError, "This Switch already has a default branch.")
+        return self._from_normalized(self.target, self._cases, _body(do, "default"))
+
+    def validate_complete(self):
+        if not self.complete:
+            raise_error(
+                ValueError,
+                "Cannot add an unfinished Switch to a circuit. Call "
+                + "``.default(gates)`` or ``.default([])`` first.",
+            )
+
+    def select(self, classical_state) -> list[Gate]:
+        """Returns the selected case/default body without executing it."""
+        self.validate_complete()
+        value = _target_outcome(self.target, classical_state)
+        for values, body in self._cases:
+            if value in values:
+                return body
+        return self._default_do
+
+    def _map_bodies(self, func) -> "Switch":
+        self.validate_complete()
+        return self._from_normalized(
+            self.target,
+            [(values, func(body)) for values, body in self._cases],
+            func(self._default_do),
+        )
+
+    def _copy(self, results: dict) -> "Switch":
+        self.validate_complete()
+        target = _remap_atom(self.target, results)
+        return self._from_normalized(
+            target,
+            [(values, _copy_body(body, results)) for values, body in self._cases],
+            _copy_body(self._default_do, results),
+        )
+
+    def _serialize(self, measurements: list) -> dict:
+        self.validate_complete()
+        reference = _measurement_reference(measurements, self.__class__.__name__)
+        return {
+            "_class": "Switch",
+            "name": self.name,
+            "target": _serialize_expression(self.target, reference),
+            "cases": [
+                {"values": list(values), "do": _serialize_body(body, measurements)}
+                for values, body in self._cases
+            ],
+            "default_do": _serialize_body(self._default_do, measurements),
+        }
+
+
+class IfChain:
+    """Fluent builder for readable ``if``/``elif``/``else`` control flow.
+
+    ``else_`` completes the builder and returns nested :class:`IfElse` nodes.
+    """
+
+    def __init__(self, branches=()):
+        self._branches = tuple(branches)
+
+    def if_(self, condition, then_do) -> "IfChain":
+        if self._branches:
+            raise_error(
+                RuntimeError,
+                "``IfChain.if_`` can only start an empty chain; use ``elif_`` next.",
+            )
+        return IfChain(((_expression(condition), _body(then_do, "then_do")),))
+
+    def elif_(self, condition, then_do) -> "IfChain":
+        if not self._branches:
+            raise_error(RuntimeError, "Call ``IfChain().if_(...)`` before ``elif_``.")
+        return IfChain(
+            self._branches + ((_expression(condition), _body(then_do, "then_do")),)
+        )
+
+    def else_(self, else_do) -> IfElse:
+        if not self._branches:
+            raise_error(RuntimeError, "Call ``IfChain().if_(...)`` before ``else_``.")
+        tail = _body(else_do, "else_do")
+        operation = None
+        for condition, then_do in reversed(self._branches):
+            operation = IfElse(
+                condition, then_do, tail if operation is None else operation
+            )
+        return operation
+
+    def _unfinished_error(self):
+        raise_error(
+            ValueError,
+            "Cannot add an unfinished IfChain to a circuit. Complete it with "
+            + "``.else_(gates)``; use ``.else_([])`` for a no-op else branch.",
+        )
+
+
 def _expression(condition):
-    """Validates the boolean expression of a condition."""
+    """Validates a boolean expression over measurement outcomes."""
     if isinstance(condition, MeasurementResult):
         condition = condition._bit()
     if isinstance(condition, bool):
         raise_error(
             TypeError,
-            "The condition is a Python ``bool``. Comparing a single bit with ``==``, "
-            + "as in ``result[0] == 1``, does not build a condition: use "
-            + "``result[0]`` or ``~result[0]``. Results build conditions only when "
-            + "compared with integers or bitstrings, as in ``result == 1``.",
+            "The condition is a Python bool, not a measurement expression. Use "
+            + "``bit.is_one()`` / ``bit.is_zero()`` or a register's "
+            + "``equals(value)`` method.",
         )
     if not isinstance(condition, Boolean) or isinstance(condition, Relational):
         raise_error(
             TypeError,
-            "A condition must be a measured bit or a boolean expression of measured "
-            + f"bits and register comparisons, but got {condition!r}.",
+            "A condition must be a measured bit or a boolean expression of "
+            + f"measurement outcomes, but got {condition!r}.",
         )
     if condition.atoms(Relational):
         raise_error(
             TypeError,
-            "Conditions cannot contain sympy relations such as ``Eq``. Use measured "
-            + "bits, ``~`` for their negation, and ``result == value``.",
+            "SymPy relations are not valid measurement conditions. Use the explicit "
+            + "measurement API such as ``result.equals(value)``.",
         )
     atoms = condition.free_symbols
     if not atoms:
         raise_error(
             ValueError,
-            f"The condition is always {condition}, so it does not depend on any "
-            + "measurement.",
+            f"The condition is always {condition}; it must depend on a measurement.",
         )
     for atom in atoms:
         if not isinstance(atom, (MeasurementSymbol, MeasurementValue)):
@@ -405,36 +477,78 @@ def _expression(condition):
 
 
 def _switch_target(target):
+    if isinstance(target, MeasurementBit):
+        target = target.is_one()
     if not isinstance(target, (MeasurementResult, MeasurementSymbol)):
         raise_error(
             TypeError,
-            "The target of a ``switch`` must be a measurement result or one of its "
-            + f"bits, but is {type(target)}.",
+            "A Switch target must be a MeasurementResult or a bit selected with "
+            + f"``result.bit(index)``, but got {type(target).__name__}.",
         )
     return target
 
 
 def _nbits(target) -> int:
-    """Number of bits of a ``switch`` target."""
-    if isinstance(target, MeasurementResult):
-        return len(target.target_qubits)
-    return 1
+    return len(target.target_qubits) if isinstance(target, MeasurementResult) else 1
 
 
 def _case_values(values) -> tuple:
-    """Values of a ``switch`` case, as given: a single value or a tuple of values."""
-    if isinstance(values, (tuple, frozenset)):
+    if isinstance(values, (tuple, list, set, frozenset)):
         if not values:
-            raise_error(ValueError, "A case of a ``switch`` needs at least one value.")
+            raise_error(ValueError, "A Switch case needs at least one value.")
         return tuple(values)
     return (values,)
 
 
-def _body(body) -> list:
-    """List of gates of a conditional branch.
+def _case_entries(cases) -> list:
+    if cases is None:
+        return []
+    return list(cases.items()) if isinstance(cases, Mapping) else list(cases)
 
-    Accepts a gate, a circuit, or (nested) iterables of gates and circuits.
-    """
+
+def _case_kind(entries) -> str | None:
+    if not entries:
+        return None
+    kinds = {
+        "bitstring" if isinstance(value, str) else "integer"
+        for values, _ in entries
+        for value in _case_values(values)
+    }
+    if len(kinds) > 1:
+        raise_error(
+            TypeError,
+            "Switch case values must be all integers or all bitstrings, not a mixture.",
+        )
+    return kinds.pop()
+
+
+def _normalize_cases(target, entries) -> list:
+    if not entries:
+        return []
+    nbits = _nbits(target)
+    raw = [(_case_values(values), do) for values, do in entries]
+    normalized = [
+        (tuple(parse_outcome(value, nbits) for value in values), _body(do, "case"))
+        for values, do in raw
+    ]
+    _check_duplicate_cases(normalized)
+    return normalized
+
+
+def _check_duplicate_cases(cases):
+    seen = set()
+    for values, _ in cases:
+        for value in values:
+            if value in seen:
+                raise_error(
+                    ValueError,
+                    f"Switch value {value} appears in more than one case.",
+                )
+            seen.add(value)
+
+
+def _body(body, argument: str) -> list:
+    """Flattens a gate, circuit, or nested iterable into a branch body."""
     from qibo.models.circuit import Circuit
 
     if isinstance(body, Gate):
@@ -443,27 +557,114 @@ def _body(body) -> list:
         return list(body.queue)
     if isinstance(body, (str, bytes, dict)) or not hasattr(body, "__iter__"):
         raise_error(
-            TypeError, f"Conditional operations must be gates, not {type(body)}."
+            TypeError,
+            f"``{argument}`` must be a gate, circuit, or iterable of gates; got "
+            + f"{type(body).__name__}.",
         )
-    return [gate for item in body for gate in _body(item)]
+    return [gate for item in body for gate in _body(item, argument)]
 
 
 def _atom_order(atom) -> tuple:
-    """Order of creation of measurement symbols and register comparisons."""
     return (isinstance(atom, MeasurementValue), int(atom.name[1:]))
 
 
-def _rebuild_atom(atom, result: MeasurementResult):
-    """The same bit, comparison or register as ``atom``, for another result."""
+def _results(atoms) -> list[MeasurementResult]:
+    results = []
+    for atom in atoms:
+        result = atom if isinstance(atom, MeasurementResult) else atom.result
+        if not any(result is other for other in results):
+            results.append(result)
+    return results
+
+
+def _lookup_result(classical_state, result: MeasurementResult) -> int:
+    from qibo.conditions import ClassicalState
+
+    state = (
+        classical_state
+        if isinstance(classical_state, ClassicalState)
+        else ClassicalState(classical_state)
+    )
+    return state.value(result)
+
+
+def _target_outcome(target, classical_state) -> int:
+    value = _lookup_result(
+        classical_state,
+        target if isinstance(target, MeasurementResult) else target.result,
+    )
+    if isinstance(target, MeasurementSymbol):
+        nbits = len(target.result.target_qubits)
+        return (value >> (nbits - target.index - 1)) & 1
+    return value
+
+
+def _evaluate(expression, classical_state) -> bool:
+    substitutions = {}
+    for atom in expression.free_symbols:
+        if isinstance(atom, MeasurementSymbol):
+            substitutions[atom] = bool(_target_outcome(atom, classical_state))
+        else:
+            substitutions[atom] = (
+                _lookup_result(classical_state, atom.result) == atom.value
+            )
+    value = expression.subs(substitutions)
+    if value not in (sympy.true, sympy.false):
+        raise_error(
+            ValueError,
+            f"Could not fully evaluate condition {expression!r} from the classical state.",
+        )
+    return value == sympy.true
+
+
+def _remap_atom(atom, results: dict):
+    old = atom if isinstance(atom, MeasurementResult) else atom.result
+    result = results.get(id(old), old)
     if isinstance(atom, MeasurementResult):
         return result
     if isinstance(atom, MeasurementSymbol):
         return result[atom.index]
-    return result == atom.value
+    return result.equals(atom.value)
+
+
+def _remap_expression(expression, results: dict):
+    return expression.xreplace(
+        {
+            atom: _remap_atom(atom, results)
+            for atom in sorted(expression.free_symbols, key=_atom_order)
+        }
+    )
+
+
+def _copy_body(body, results: dict) -> list:
+    return [
+        gate._copy(results) if isinstance(gate, ControlFlowOp) else copy.copy(gate)
+        for gate in body
+    ]
+
+
+def _measurement_reference(measurements: list, operation: str):
+    def reference(result):
+        index = _find_measurement(measurements, result)
+        if index is None:
+            raise_error(
+                ValueError,
+                f"Cannot serialize {operation}: one of its measurements is not "
+                + "performed before it in the circuit.",
+            )
+        return index
+
+    return reference
+
+
+def _serialize_body(body: list, measurements: list) -> list[dict]:
+    return [
+        gate._serialize(measurements) if isinstance(gate, ControlFlowOp) else gate.raw
+        for gate in body
+    ]
 
 
 def _serialize_expression(expression, reference) -> dict:
-    """JSON-compatible form of a condition, with measurements given by position."""
     if isinstance(expression, MeasurementResult):
         return {"register": reference(expression)}
     if isinstance(expression, MeasurementSymbol):
@@ -479,25 +680,18 @@ def _serialize_expression(expression, reference) -> dict:
 
 
 def _deserialize_expression(raw: dict, measurements: list):
-    """Counter-part of :func:`_serialize_expression`."""
     (name, value), *_ = raw.items()
     if name == "register":
         return measurements[value].result
     if name == "bit":
         return measurements[value[0]].result[value[1]]
     if name == "equals":
-        return measurements[value[0]].result == value[1]
+        return measurements[value[0]].result.equals(value[1])
     args = [_deserialize_expression(arg, measurements) for arg in value]
-    operations = {"not": Not, "and": And, "or": Or, "xor": Xor}
-    return operations[name](*args)
+    return {"not": Not, "and": And, "or": Or, "xor": Xor}[name](*args)
 
 
 def _find_measurement(measurements: list, result: MeasurementResult) -> int | None:
-    """Index of the last measurement gate in ``measurements`` that writes ``result``.
-
-    Measurement gates copied with :meth:`qibo.gates.M.on_qubits` share their
-    result object, so a condition always refers to the closest preceding one.
-    """
     for index in range(len(measurements) - 1, -1, -1):
         if measurements[index].result is result:
             return index

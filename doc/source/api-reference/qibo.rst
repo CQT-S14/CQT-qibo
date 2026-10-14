@@ -737,10 +737,18 @@ Measurement (M)
     :members:
     :member-order: bysource
 
-Conditional operations (Condition)
-""""""""""""""""""""""""""""""""""""
+Conditional operations
+""""""""""""""""""""""
 
-.. autoclass:: qibo.gates.Condition
+.. autoclass:: qibo.gates.IfElse
+    :members:
+    :member-order: bysource
+
+.. autoclass:: qibo.gates.Switch
+    :members:
+    :member-order: bysource
+
+.. autoclass:: qibo.gates.IfChain
     :members:
     :member-order: bysource
 

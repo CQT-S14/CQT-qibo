@@ -12,4 +12,5 @@ different topics and quantum algorithms:
 
     examples
     advancedexamples
+    conditional_operations
     applications

@@ -4,6 +4,7 @@ __version__ = im.version(__package__)
 
 from qibo import (
     callbacks,
+    conditions,
     gates,
     hamiltonians,
     models,
@@ -45,6 +46,7 @@ __all__ = [
     "Circuit",
     "__version__",
     "callbacks",
+    "conditions",
     "construct_backend",
     "gates",
     "get_backend",

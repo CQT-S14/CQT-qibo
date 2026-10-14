@@ -275,10 +275,10 @@ class Gate:
             measurements,
         )
 
-        if raw["_class"] == "Condition":
+        if raw["_class"] in {"IfElse", "Switch"}:
             raise_error(
                 ValueError,
-                "A ``Condition`` refers to a measurement of its circuit, "
+                "A classical control-flow operation refers to measurements of its circuit, "
                 + "so it can only be loaded with ``Circuit.from_dict``.",
             )
 

@@ -76,12 +76,35 @@ class MeasurementSymbol(sympy.Symbol):
         return expr.subs(self, self.outcome())
 
 
+class MeasurementBit:
+    """Readable reference to one bit of a :class:`MeasurementResult`.
+
+    This lightweight wrapper keeps the explicit ``is_one`` / ``is_zero`` API
+    separate from SymPy's own attributes with those names.
+    """
+
+    def __init__(self, result, index: int):
+        self.result = result
+        self.index = index
+
+    def is_one(self):
+        """Condition that this measured bit is one."""
+        return self.result.symbols[self.index]
+
+    def is_zero(self):
+        """Condition that this measured bit is zero."""
+        return ~self.result.symbols[self.index]
+
+    def __repr__(self):
+        return f"MeasurementBit(qubits={self.result.target_qubits}, index={self.index})"
+
+
 class MeasurementValue(sympy.Symbol):
     """``sympy.Symbol`` that is true when a measured register has a given value.
 
     Created by comparing a :class:`qibo.measurements.MeasurementResult` with an
     outcome, as in ``result == 2``, to be used in the conditions of
-    :class:`qibo.gates.Condition`.
+    :class:`qibo.gates.IfElse`.
     """
 
     _counter = 0
@@ -145,12 +168,13 @@ class MeasurementResult:
     :class:`qibo.measurements.MeasurementResult` objects can be obtained
     when adding measurement gates to a circuit.
 
-    The outcomes can also be used to build the conditions of
-    :class:`qibo.gates.Condition`: ``result[i]`` is the symbol of the
-    :math:`i`-th measured bit (the same as ``result.symbols[i]``), a result of a
-    single qubit can be used directly as a bit, bits are combined with ``&``,
-    ``|``, ``^`` and ``~``, and ``result == value`` (or ``!=``) compares the
-    whole register with an integer or a bitstring.
+    The outcomes can also build the conditions of :class:`qibo.gates.IfElse`:
+    ``result.bit(i)`` is an explicit reference to the :math:`i`-th measured bit,
+    providing ``is_one()`` and ``is_zero()``. The shorthand ``result[i]`` gives
+    the corresponding SymPy symbol. A result of a single qubit can be used
+    directly as a bit, bits are combined with ``&``, ``|``, ``^`` and ``~``,
+    and ``result == value`` (or ``!=``) compares the whole register with an
+    integer or a bitstring.
 
     Args:
         gate (:class:`qibo.gates.M`): Measurement gate associated with
@@ -175,8 +199,45 @@ class MeasurementResult:
     __hash__ = object.__hash__
 
     def __getitem__(self, index: int) -> MeasurementSymbol:
-        """Symbol of a measured bit, the same as ``result.symbols[index]``."""
+        """Shorthand symbol for a measured bit."""
         return self.symbols[index]
+
+    def bit(self, index: int) -> MeasurementBit:
+        """Returns an explicit bit reference (zero is the most significant)."""
+        if not isinstance(index, Integral):
+            raise_error(
+                TypeError,
+                f"A measurement bit index must be an integer, but got {index!r}.",
+            )
+        nbits = len(self.target_qubits)
+        if not -nbits <= index < nbits:
+            raise_error(
+                IndexError,
+                f"Bit index {index} is out of range for a {nbits}-bit measurement.",
+            )
+        return MeasurementBit(self, index % nbits)
+
+    def is_one(self):
+        """Explicit condition that a single-bit measurement is one."""
+        return self._bit()
+
+    def is_zero(self):
+        """Explicit condition that a single-bit measurement is zero."""
+        return ~self._bit()
+
+    def equals(self, value):
+        """Explicit condition that the whole measured register equals ``value``."""
+        nbits = len(self.target_qubits)
+        value = parse_outcome(value, nbits)
+        if nbits == 1:
+            return self.symbols[0] if value else ~self.symbols[0]
+        if value not in self._values:
+            self._values[value] = MeasurementValue(self, value)
+        return self._values[value]
+
+    def not_equals(self, value):
+        """Explicit condition that the measured register does not equal ``value``."""
+        return ~self.equals(value)
 
     def _bit(self) -> MeasurementSymbol:
         """Symbol of the measured bit, for results of a single qubit."""
@@ -185,8 +246,8 @@ class MeasurementResult:
             raise_error(
                 TypeError,
                 f"A measurement of {nbits} qubits cannot be used as a single bit. "
-                + "Use one of its bits, as in ``result[0]``, or compare it with a "
-                + "value, as in ``result == 2``.",
+                + "Use ``result.bit(index)`` or compare the register with "
+                + "``result.equals(value)``.",
             )
         return self.symbols[0]
 
@@ -217,13 +278,7 @@ class MeasurementResult:
     def __eq__(self, value):
         if not isinstance(value, (Integral, str)):
             return NotImplemented
-        nbits = len(self.target_qubits)
-        value = parse_outcome(value, nbits)
-        if nbits == 1:
-            return self.symbols[0] if value else ~self.symbols[0]
-        if value not in self._values:
-            self._values[value] = MeasurementValue(self, value)
-        return self._values[value]
+        return self.equals(value)
 
     def __ne__(self, value):
         condition = self.__eq__(value)

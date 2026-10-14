@@ -510,33 +510,30 @@ If more than one qubits are used in a ``collapse=True`` measurement gate the
 Applying gates conditionally on measurement outcomes
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Measurement outcomes can also decide whether gates are applied at all, using
-:class:`qibo.gates.Condition`. A condition is built from the ``output`` of
-``collapse=True`` measurements: ``output[i]`` is the :math:`i`-th measured bit
-(the same as ``output.symbols[i]``), and the output of a single-qubit
-measurement is itself a bit. Bits are combined with ``&``, ``|``, ``^`` and
-``~``, and ``output == value`` compares a whole register with an integer or a
-bitstring, where ``output[0]`` is the most significant bit:
+Measurement outcomes can select gates using :class:`qibo.gates.IfElse` and
+:class:`qibo.gates.Switch`. Conditions have an explicit API: ``is_one()``,
+``is_zero()``, ``bit(index)``, ``equals(value)`` and ``not_equals(value)``.
+Named helpers in :mod:`qibo.conditions` combine expressions readably:
 
 .. testcode::
 
-    from qibo import Circuit, gates
+    from qibo import Circuit, conditions, gates
 
     circuit = Circuit(4)
     circuit.add([gates.H(0), gates.H(1), gates.H(2)])
     first = circuit.add(gates.M(0, collapse=True))
     register = circuit.add(gates.M(1, 2, collapse=True))
     # flip qubit 3 if qubit 0 was measured in state 1
-    circuit.add(gates.Condition(first, gates.X(3)))
+    circuit.add(gates.IfElse(first.is_one(), then_do=gates.X(3)))
     # apply H and T to qubit 3 if qubit 0 was 0 and qubit 2 was 1
-    circuit.add(gates.Condition(~first & register[1], [gates.H(3), gates.T(3)]))
+    test = conditions.all_of(first.is_zero(), register.bit(1).is_one())
+    circuit.add(gates.IfElse(test, then_do=[gates.H(3), gates.T(3)]))
     # apply Z to qubit 3 if qubits 1 and 2 were measured in 1 and 0
-    circuit.add(gates.Condition(register == "10", gates.Z(3)))
+    circuit.add(gates.IfElse(register.equals("10"), then_do=gates.Z(3)))
 
-The gates can be a single gate, a list of gates or a circuit. With a
-dictionary instead of gates, a register or bit selects the gates of its value,
-like a ``switch`` statement. The values are either all integers or all
-bitstrings, and a tuple of values shares the same gates:
+The gates can be a single gate, a list of gates or a circuit. ``Switch`` selects
+a body from the value of a register or bit. A tuple groups values, and the
+default is explicit:
 
 .. testcode::
 
@@ -546,13 +543,10 @@ bitstrings, and a tuple of values shares the same gates:
     circuit.add([gates.H(0), gates.H(1)])
     output = circuit.add(gates.M(0, 1, collapse=True))
     circuit.add(
-        gates.Condition(output, {0: gates.X(2), (1, 2): [gates.H(2), gates.S(2)]})
-    )
-    # the same cases written with bitstrings
-    circuit.add(
-        gates.Condition(
-            output, {"00": gates.X(2), ("01", "10"): [gates.H(2), gates.S(2)]}
-        )
+        gates.Switch(output)
+        .case(0, gates.X(2))
+        .case((1, 2), [gates.H(2), gates.S(2)])
+        .default([])
     )
 
 Simulation of conditional gates is not supported yet, but circuits containing
@@ -567,13 +561,16 @@ with Qiskit:
     qasm = circuit.to_qasm3()
     qiskit_circuit = qiskit.qasm3.loads(qasm)
 
-By default, conditions only use the tests that Qiskit's importer can read:
+By default, control flow only uses the tests that Qiskit's importer can read:
 boolean expressions become nested ``if``/``else`` statements and a ``switch``
 becomes an ``if``/``else if`` chain.
 ``circuit.to_qasm3(qiskit_compatible=False)`` writes them with the OpenQASM 3
 operators ``&&``, ``||``, ``!``, ``!=`` and ``switch`` statements instead.
 Programs with many mid-circuit measurements can reuse the classical registers
 whose outcomes are no longer needed with ``circuit.to_qasm3(reuse_registers=True)``.
+
+See :doc:`conditional_operations` for the complete API, including fluent
+``if``/``elif``/``else`` chains, branch inspection and validation rules.
 
 
 How to invert a circuit?

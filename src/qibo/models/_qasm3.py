@@ -95,7 +95,7 @@ class QASM3Exporter:
     Measurements without ``collapse`` are written at the end of the program,
     as in :meth:`qibo.models.circuit.Circuit.to_qasm`. Mid-circuit
     measurements (``collapse=True``, or measurements whose outcome is used by
-    a :class:`qibo.gates.Condition`) are written in place, each into its own
+    a :class:`qibo.gates.ControlFlowOp`) are written in place, each into its own
     ``bit`` register. Their bit ``i`` holds ``result.symbols[i]``.
 
     Args:
@@ -132,15 +132,15 @@ class QASM3Exporter:
         for position, gate in enumerate(self.queue):
             if isinstance(gate, gates.M):
                 latest[id(gate.result)] = position
-            elif isinstance(gate, gates.Condition):
-                for condition in gate._nested_conditions():
+            elif isinstance(gate, gates.ControlFlowOp):
+                for condition in gate._nested_control_flow():
                     sources = {}
                     for result in condition.results:
                         source = latest.get(id(result))
                         if source is None:
                             raise_error(
                                 ValueError,
-                                "A ``Condition`` depends on a measurement that is "
+                                "A control-flow operation depends on a measurement that is "
                                 + "not performed before it in the circuit.",
                             )
                         sources[id(result)] = source
@@ -211,7 +211,7 @@ class QASM3Exporter:
                     # the bits of collapsing measurements follow the qubit order
                     for i, qubit in enumerate(sorted(gate.target_qubits)):
                         statements.append(f"{register}[{i}] = measure q[{qubit}];")
-            elif isinstance(gate, gates.Condition):
+            elif isinstance(gate, gates.ControlFlowOp):
                 statements.extend(self._condition(gate, position, 0))
             else:
                 statements.extend(self._gate(gate))
@@ -295,7 +295,7 @@ class QASM3Exporter:
         def register(result):
             return self.registers[sources[id(result)]]
 
-        if condition.target is not None:
+        if isinstance(condition, gates.Switch):
             return self._switch(condition, register, position, depth)
 
         # atoms are taken in the order the circuit measures them, comparisons of
@@ -313,7 +313,9 @@ class QASM3Exporter:
             test = self._expression(
                 condition.expression, register, lambda atom: order(atom)[1:]
             )
-            return self._chain([(test, condition.body)], position, depth)
+            return self._chain(
+                [(test, condition.then_do)], condition.else_do, position, depth
+            )
 
         atoms = sorted(condition.atoms, key=order)
         tree = _decision_tree(condition.expression, atoms)
@@ -322,35 +324,25 @@ class QASM3Exporter:
     def _tree(self, tree, condition, register, position: int, depth: int) -> list[str]:
         """Statements of a decision tree at indentation ``depth``.
 
-        A leaf ``True`` stands for the body, a leaf ``False`` for no gates.
+        A leaf selects the ``then_do`` or ``else_do`` branch.
         """
         if tree is True:
-            return self._statements(condition.body, position, depth)
+            return self._statements(condition.then_do, position, depth)
         if tree is False:
-            return []
+            return self._statements(condition.else_do, position, depth)
         indent = "  " * depth
         lines = []
         keyword = "if"
         while isinstance(tree, tuple):
             atom, high, low = tree
             test = self._atom(atom, register)
-            if (
-                high is False
-                and low is not False
-                and isinstance(atom, MeasurementSymbol)
-            ):
-                # test the negated bit, so that the empty branch is not written.
-                # Qiskit cannot read negated register comparisons, which keep an
-                # empty first branch instead
-                test, high, low = f"!{test}", low, high
             lines.append(f"{indent}{keyword} ({test}) {{")
             lines.extend(self._tree(high, condition, register, position, depth + 1))
             keyword = "} else if"
             tree = low
         rest = self._tree(tree, condition, register, position, depth + 1)
-        if rest:
-            lines.append(f"{indent}}} else {{")
-            lines.extend(rest)
+        lines.append(f"{indent}}} else {{")
+        lines.extend(rest)
         lines.append(f"{indent}}}")
         return lines
 
@@ -402,8 +394,7 @@ class QASM3Exporter:
             name, nbits = register(target), len(target.target_qubits)
         else:
             name, nbits = f"{register(target.result)}[{target.index}]", 1
-        nvalues = sum(len(values) for values, _ in condition.cases)
-        if not self.qiskit_compatible and nvalues > 1:
+        if not self.qiskit_compatible:
             indent = "  " * depth
             lines = [f"{indent}switch (int({name})) {{"]
             for values, body in condition.cases:
@@ -411,6 +402,9 @@ class QASM3Exporter:
                 lines.append(f"{indent}  case {labels} {{")
                 lines.extend(self._statements(body, position, depth + 2))
                 lines.append(f"{indent}  }}")
+            lines.append(f"{indent}  default {{")
+            lines.extend(self._statements(condition.default_do, position, depth + 2))
+            lines.append(f"{indent}  }}")
             lines.append(f"{indent}}}")
             return lines
 
@@ -423,16 +417,18 @@ class QASM3Exporter:
         branches = [
             (test(value), body) for values, body in condition.cases for value in values
         ]
-        return self._chain(branches, position, depth)
+        return self._chain(branches, condition.default_do, position, depth)
 
-    def _chain(self, branches, position: int, depth: int) -> list[str]:
-        """An ``if``/``else if`` chain of ``(test, body)`` branches."""
+    def _chain(self, branches, default_do, position: int, depth: int) -> list[str]:
+        """An ``if``/``else if`` chain followed by an explicit ``else``."""
         indent = "  " * depth
         lines = []
         for i, (test, body) in enumerate(branches):
             keyword = "if" if i == 0 else "} else if"
             lines.append(f"{indent}{keyword} ({test}) {{")
             lines.extend(self._statements(body, position, depth + 1))
+        lines.append(f"{indent}}} else {{")
+        lines.extend(self._statements(default_do, position, depth + 1))
         lines.append(f"{indent}}}")
         return lines
 
@@ -441,7 +437,7 @@ class QASM3Exporter:
         indent = "  " * depth
         lines = []
         for gate in body:
-            if isinstance(gate, gates.Condition):
+            if isinstance(gate, gates.ControlFlowOp):
                 lines.extend(self._condition(gate, position, depth))
             else:
                 lines.extend(indent + line for line in self._gate(gate))

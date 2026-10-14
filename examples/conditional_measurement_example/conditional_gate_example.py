@@ -1,10 +1,10 @@
 """Conditional operations on mid-circuit measurements, exported to OpenQASM 3.
 
-Simulation of ``gates.Condition`` is not supported yet, so the circuit is
+Native Qibo simulation of control flow is not supported yet, so the circuit is
 converted to OpenQASM 3 and, if Qiskit is installed, executed with Qiskit Aer.
 """
 
-from qibo import Circuit, gates
+from qibo import Circuit, conditions, gates
 
 circuit = Circuit(4)
 circuit.add([gates.H(0), gates.H(1), gates.H(2)])
@@ -14,14 +14,22 @@ first = circuit.add(gates.M(0, collapse=True))
 register = circuit.add(gates.M(1, 2, collapse=True))
 
 # active reset: flip qubit 0 back to |0> if it was measured in |1>
-circuit.add(gates.Condition(first, gates.X(0)))
+circuit.add(gates.IfElse(first.is_one(), then_do=gates.X(0)))
 # boolean expression of bits, with several gates
-circuit.add(gates.Condition(first & ~register[1], [gates.H(3), gates.S(3)]))
+circuit.add(
+    gates.IfElse(
+        conditions.all_of(first.is_one(), register.bit(1).is_zero()),
+        then_do=[gates.H(3), gates.S(3)],
+    )
+)
 # comparison of a register: qibo's bit order, register[0] is the most significant
-circuit.add(gates.Condition(register != "01", gates.Z(3)))
+circuit.add(gates.IfElse(register.not_equals("01"), then_do=gates.Z(3), else_do=[]))
 # switch on the value of a register; a tuple of values shares the gates
 circuit.add(
-    gates.Condition(register, {0: gates.Z(3), (1, 2): [gates.H(3), gates.T(3)]})
+    gates.Switch(register)
+    .case(0, gates.Z(3))
+    .case((1, 2), [gates.H(3), gates.T(3)])
+    .default([])
 )
 circuit.add(gates.M(0, 1, 2, 3, register_name="result"))
 
