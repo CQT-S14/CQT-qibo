@@ -3,6 +3,7 @@
 Run from the repository root with:
 
     .venv/bin/python examples/conditional_measurement_example/native_conditional_execution.py
+    or activating  .venv_conditional_operations (it has cqt-qibo installed in editable)
 """
 
 from qibo import Circuit, gates, get_backend, set_backend

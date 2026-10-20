@@ -216,6 +216,8 @@ paths.
 | `qibojit`, `platform="numba"` | Supported on CPU and covered by the same test matrix as NumPy. |
 | `qibojit`, `platform="cupy"` | **Not tested and explicitly unsupported.** Qibo rejects native conditional execution before simulation. |
 | `qibojit`, `platform="cuquantum"` | **Not tested and explicitly unsupported.** Qibo rejects native conditional execution before simulation. |
+| Clifford backend | **Explicitly unsupported.** Its stabilizer representation requires a dedicated implementation of measurement-driven branch execution. |
+| Hamming-weight backend | **Explicitly unsupported.** Its reduced state representation and gate-application path require a dedicated implementation. |
 | Distributed/multi-GPU execution | **Not tested and explicitly unsupported.** Circuits with accelerators are rejected. |
 | Compiled execution | Explicitly unsupported for all backends. |
 
@@ -227,6 +229,11 @@ of live measurement outcomes, branch-gate application, repeated shots, nested
 control flow, density matrices, and circuit reuse. The current backend guard
 keeps these unverified paths outside the claim and produces an error naming the
 received platform.
+
+The same fail-loudly rule applies to Clifford, hamming-weight, compiled, and
+distributed execution. These modes do not silently skip the conditional
+operation or fall back to export: each must gain its own correct implementation
+and tests before entering the supported set.
 
 ## Inspecting branch selection
 
