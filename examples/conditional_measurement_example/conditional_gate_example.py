@@ -1,7 +1,13 @@
-"""Conditional operations on mid-circuit measurements, exported to OpenQASM 3.
+"""Export conditional operations to OpenQASM 3 and execute them with Qiskit Aer.
 
-Native Qibo simulation of control flow is not supported yet, so the circuit is
-converted to OpenQASM 3 and, if Qiskit is installed, executed with Qiskit Aer.
+Qibo can now execute classical control flow natively with its NumPy backend and
+with qibojit's Numba platform. This example focuses instead on interoperability:
+it constructs the conditional circuit using Qibo's public API, shows both QASM 3
+export modes, and, when Qiskit is installed, executes the compatible export with
+Qiskit Aer.
+
+For focused native Qibo examples using ``IfElse``, ``Switch``, and ``IfChain``,
+see ``native_conditional_execution.py`` in this directory.
 """
 
 from qibo import Circuit, conditions, gates
