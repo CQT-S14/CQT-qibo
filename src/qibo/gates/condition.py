@@ -162,12 +162,21 @@ class ControlFlowOp(Gate):
         )
 
     def apply(self, backend, state, nqubits):
-        raise_error(
-            NotImplementedError,
-            "Native Qibo simulation of classical control flow is not implemented. "
-            + "Export the circuit with ``Circuit.to_qasm3`` or inspect a selected "
-            + "branch with ``operation.select(classical_state)``.",
-        )
+        """Selects and applies one branch using live NumPy measurement outcomes."""
+        if backend.name != "numpy":
+            raise_error(
+                NotImplementedError,
+                "Native Qibo execution of classical control flow currently supports "
+                + "only the NumPy backend, but received "
+                + f"{backend.name!r}.",
+            )
+
+        classical_state = [(result, _latest_outcome(result)) for result in self.results]
+        for gate in self.select(classical_state):
+            if gate.symbolic_parameters:
+                gate.substitute_symbols()
+            state = gate.apply(backend, state, nqubits)
+        return state
 
     def apply_clifford(self, backend, state, nqubits):
         return self.apply(backend, state, nqubits)
@@ -575,6 +584,19 @@ def _results(atoms) -> list[MeasurementResult]:
         if not any(result is other for other in results):
             results.append(result)
     return results
+
+
+def _latest_outcome(result: MeasurementResult) -> int:
+    """Returns the latest sampled register value produced during execution."""
+    if not result.has_samples():
+        raise_error(
+            RuntimeError,
+            "Cannot evaluate classical control flow because the measurement on "
+            + f"qubits {result.target_qubits} has no outcome. Ensure that the "
+            + "referenced measurement is executed before the control-flow operation.",
+        )
+    bits = result._samples[-1]
+    return sum(int(bit) << (len(bits) - index - 1) for index, bit in enumerate(bits))
 
 
 def _lookup_result(classical_state, result: MeasurementResult) -> int:

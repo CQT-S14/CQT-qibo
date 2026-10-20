@@ -1,10 +1,6 @@
-"""Template showing the main conditional-operations API forms.
+"""Template showing construction, native NumPy execution, and QASM 3 export."""
 
-This example builds and exports control flow. Native Qibo simulation of these
-operations is intentionally not implemented yet.
-"""
-
-from qibo import Circuit, conditions, gates
+from qibo import Circuit, conditions, gates, set_backend
 
 circuit = Circuit(5)
 
@@ -68,6 +64,22 @@ standalone_switch = gates.Switch(
 selected_gates = standalone_switch.select({syndrome: "10"})
 print("Selected branch:", selected_gates)
 
-# Export is supported today. Set qiskit_compatible=False for native switch syntax.
+# A compact circuit executing conditional control flow natively with NumPy.
+set_backend("numpy")
+native_circuit = Circuit(2)
+native_circuit.add(gates.H(0))
+native_first = native_circuit.add(gates.M(0, collapse=True))
+native_circuit.add(
+    gates.IfElse(
+        native_first.is_one(),
+        then_do=gates.X(1),
+        else_do=gates.I(1),
+    )
+)
+native_circuit.add(gates.M(0, 1, register_name="result"))
+native_result = native_circuit(nshots=1000)
+print("Native NumPy frequencies:", native_result.frequencies(binary=True))
+
+# Export remains available. Set qiskit_compatible=False for native switch syntax.
 print(circuit.to_qasm3())
 print(circuit.to_qasm3(qiskit_compatible=False))

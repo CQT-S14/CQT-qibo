@@ -9,9 +9,9 @@ measurement outcomes. The public API has two operations:
 `gates.IfChain` is a fluent builder for `if`/`elif`/`else`; it lowers to nested
 `IfElse` operations, so it does not introduce a third control-flow node.
 
-> Native Qibo simulation of these operations is not implemented yet. Circuits
-> containing them can be exported with `Circuit.to_qasm3()`. The `select()`
-> method described below only identifies a branch; it does not execute gates.
+> Native execution is available with Qibo's NumPy backend. Other backends,
+> compiled circuits, and distributed execution fail explicitly until they gain
+> dedicated support. Circuits can also be exported with `Circuit.to_qasm3()`.
 
 ## Measurement expressions
 
@@ -158,6 +158,41 @@ operation = (
     .default([])
 )
 ```
+
+## Native NumPy execution
+
+Select the NumPy backend and execute the circuit normally. During every shot,
+Qibo collapses the referenced measurement, evaluates the condition using that
+shot's outcome, applies exactly one branch, and continues with the circuit:
+
+```python
+from qibo import Circuit, gates, set_backend
+
+set_backend("numpy")
+
+circuit = Circuit(2)
+circuit.add(gates.H(0))
+first = circuit.add(gates.M(0, collapse=True))
+circuit.add(
+    gates.IfElse(
+        condition=first.is_one(),
+        then_do=gates.X(1),
+        else_do=gates.I(1),
+    )
+)
+circuit.add(gates.M(0, 1, register_name="result"))
+
+result = circuit(nshots=1000)
+print(result.frequencies(binary=True))  # only 00 and 11
+```
+
+Every measurement referenced by an `IfElse` or `Switch`, including nested
+operations, must occur earlier in the same circuit. Reusing a circuit is safe:
+measurement outcomes are cleared at the beginning of each execution.
+
+For state-vector execution with several shots, add a final non-collapsing
+measurement as above so Qibo can return shot outcomes. To retrieve an averaged
+final quantum state after stochastic control flow, use a density-matrix circuit.
 
 ## Inspecting branch selection
 

@@ -393,6 +393,13 @@ def execute_circuit(
         HammingWeightResult,
     )
 
+    if any(isinstance(gate, gates.ControlFlowOp) for gate in circuit.queue):
+        raise_error(
+            NotImplementedError,
+            "Native Qibo execution of classical control flow is not implemented "
+            + "for the hamming-weight backend.",
+        )
+
     if circuit.density_matrix:
         raise_error(RuntimeError, "Density matrix simulation is not supported.")
 

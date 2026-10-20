@@ -209,6 +209,13 @@ class CliffordBackend(Backend):
         """
         from qibo.quantum_info.clifford import Clifford
 
+        if any(isinstance(gate, gates.ControlFlowOp) for gate in circuit.queue):
+            raise_error(
+                NotImplementedError,
+                "Native Qibo execution of classical control flow is not "
+                + "implemented for the Clifford backend.",
+            )
+
         if self.platform == "stim":
             return self._execute_circuit_stim(circuit, initial_state, nshots)
 

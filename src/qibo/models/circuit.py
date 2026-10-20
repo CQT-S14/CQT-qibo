@@ -1110,6 +1110,13 @@ class Circuit:
         if not self.queue:
             raise_error(RuntimeError, "Cannot compile circuit without gates.")
 
+        if any(isinstance(gate, gates.ControlFlowOp) for gate in self.queue):
+            raise_error(
+                NotImplementedError,
+                "Circuit compilation is not available for circuits containing "
+                + "classical control flow.",
+            )
+
         for gate in self.queue:
             if isinstance(gate, gates.CallbackGate):  # pragma: no cover
                 raise_error(
@@ -1145,18 +1152,26 @@ class Circuit:
             Either a ``qibo.result.QuantumState``, ``qibo.result.MeasurementOutcomes``
             or ``qibo.result.CircuitResult`` depending on the circuit's configuration.
         """
-        if any(isinstance(gate, gates.ControlFlowOp) for gate in self.queue):
-            raise_error(
-                NotImplementedError,
-                "Native Qibo simulation of classical control flow is not implemented. "
-                + "Export the circuit with ``Circuit.to_qasm3``.",
-            )
         if self.compiled:
             state = self.compiled.executor(initial_state, nshots)
             self._final_state = self.compiled.result(state, nshots)
             return self._final_state
 
         backend = _Global.backend()
+        if any(isinstance(gate, gates.ControlFlowOp) for gate in self.queue):
+            if backend.name != "numpy":
+                raise_error(
+                    NotImplementedError,
+                    "Native Qibo execution of classical control flow currently "
+                    + "supports only the NumPy backend, but received "
+                    + f"{backend.name!r}.",
+                )
+            if self.accelerators:  # pragma: no cover
+                raise_error(
+                    NotImplementedError,
+                    "Native Qibo execution of classical control flow is not "
+                    + "implemented for distributed circuits.",
+                )
         transpiler = _Global.transpiler()
         transpiled_circuit, _ = transpiler(self)
 
@@ -1596,9 +1611,7 @@ class Circuit:
                     matrix, idx = self._update_draw_matrix(
                         matrix, idx, subgate, parallel=parallel
                     )
-        return self._update_draw_matrix(
-            matrix, idx, condition, "]", parallel=parallel
-        )
+        return self._update_draw_matrix(matrix, idx, condition, "]", parallel=parallel)
 
     def diagram(
         self, line_wrap: int = 100, legend: bool = False, parallel: bool = False
@@ -1638,9 +1651,7 @@ class Circuit:
                 )
                 for q in gate.qubits:
                     idx[q] = max(idx[q], start)
-                matrix, idx = self._draw_condition(
-                    matrix, idx, gate, parallel=parallel
-                )
+                matrix, idx = self._draw_condition(matrix, idx, gate, parallel=parallel)
             else:
                 matrix, idx = self._update_draw_matrix(
                     matrix, idx, gate, parallel=parallel

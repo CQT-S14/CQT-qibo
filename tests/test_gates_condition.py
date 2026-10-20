@@ -4,10 +4,12 @@ import copy
 import json
 import pickle
 
+import numpy as np
 import pytest
 import sympy
 
-from qibo import Circuit, conditions, gates
+from qibo import Circuit, conditions, gates, get_backend, set_backend
+from qibo.backends import NumpyBackend
 from qibo.measurements import MeasurementResult, MeasurementSymbol, MeasurementValue
 
 
@@ -218,17 +220,122 @@ def test_switch_case_validation(cases, error, match):
         gates.Switch(result, cases, default_do=[])
 
 
-def test_circuit_integration_and_native_simulation_error():
+def test_circuit_integration_and_numpy_native_execution():
     circuit, _ = feed_forward_circuit()
     operation = circuit.queue[2]
     assert circuit.has_collapse
     assert isinstance(operation, gates.ControlFlowOp)
-    with pytest.raises(NotImplementedError, match="Native Qibo simulation"):
-        circuit(nshots=10)
+
+    set_backend("numpy")
+    get_backend().set_seed(123)
+    result = circuit(nshots=100)
+    frequencies = result.frequencies(binary=True)
+    assert set(frequencies) <= {"00", "11"}
+    assert sum(frequencies.values()) == 100
+    assert all(frequencies[outcome] > 0 for outcome in ("00", "11"))
+
     with pytest.raises(NotImplementedError):
         operation.matrix()
     with pytest.raises(NotImplementedError):
         circuit.to_qasm()
+
+
+@pytest.mark.parametrize(
+    "prepare_one, expected",
+    [(False, [0, 0]), (True, [1, 1])],
+)
+def test_numpy_ifelse_deterministic_branches(prepare_one, expected):
+    circuit = Circuit(2)
+    if prepare_one:
+        circuit.add(gates.X(0))
+    result = circuit.add(gates.M(0, collapse=True))
+    circuit.add(
+        gates.IfElse(
+            result.is_one(),
+            then_do=gates.X(1),
+            else_do=gates.I(1),
+        )
+    )
+    circuit.add(gates.M(0, 1))
+
+    samples = NumpyBackend().execute_circuit(circuit, nshots=10).samples()
+    np.testing.assert_array_equal(samples, np.tile(expected, (10, 1)))
+
+
+def test_numpy_switch_and_nested_control_flow():
+    circuit = Circuit(3)
+    circuit.add(gates.X(0))
+    first = circuit.add(gates.M(0, collapse=True))
+    syndrome = circuit.add(gates.M(1, collapse=True))
+    correction = (
+        gates.Switch(syndrome).case(0, gates.X(2)).case(1, gates.Z(2)).default([])
+    )
+    circuit.add(
+        gates.IfElse(
+            conditions.all_of(first.is_one(), syndrome.is_zero()),
+            then_do=correction,
+            else_do=gates.I(2),
+        )
+    )
+    circuit.add(gates.M(0, 1, 2))
+
+    samples = NumpyBackend().execute_circuit(circuit, nshots=10).samples()
+    np.testing.assert_array_equal(samples, np.tile([1, 0, 1], (10, 1)))
+
+
+def test_numpy_control_flow_uses_current_execution_outcome():
+    circuit = Circuit(2)
+    result = circuit.add(gates.M(0, collapse=True))
+    circuit.add(
+        gates.IfElse(
+            result.is_one(),
+            then_do=gates.X(1),
+            else_do=gates.I(1),
+        )
+    )
+    circuit.add(gates.M(0, 1))
+    backend = NumpyBackend()
+
+    state_one = np.zeros(4, dtype=complex)
+    state_one[2] = 1
+    first = backend.execute_circuit(circuit, initial_state=state_one, nshots=1)
+    np.testing.assert_array_equal(first.samples()[0], [1, 1])
+
+    state_zero = np.zeros(4, dtype=complex)
+    state_zero[0] = 1
+    second = backend.execute_circuit(circuit, initial_state=state_zero, nshots=1)
+    np.testing.assert_array_equal(second.samples()[0], [0, 0])
+
+
+def test_numpy_control_flow_density_matrix():
+    circuit = Circuit(2, density_matrix=True)
+    circuit.add(gates.X(0))
+    result = circuit.add(gates.M(0, collapse=True))
+    circuit.add(
+        gates.IfElse(
+            result.is_one(),
+            then_do=gates.X(1),
+            else_do=gates.I(1),
+        )
+    )
+
+    final_state = NumpyBackend().execute_circuit(circuit, nshots=5)
+    np.testing.assert_allclose(final_state.probabilities(), [0, 0, 0, 1])
+
+
+def test_numpy_control_flow_requires_prior_measurement():
+    external = Circuit(1).add(gates.M(0, collapse=True))
+    circuit = Circuit(1)
+    circuit.add(gates.IfElse(external.is_one(), then_do=gates.X(0)))
+
+    with pytest.raises(ValueError, match="not performed before"):
+        NumpyBackend().execute_circuit(circuit, nshots=1)
+
+
+def test_control_flow_compilation_fails_loudly():
+    circuit, _ = feed_forward_circuit()
+    with pytest.raises(NotImplementedError, match="compilation"):
+        circuit.compile(backend=NumpyBackend())
 
 
 def test_parameters_moments_drawing_and_fusion():

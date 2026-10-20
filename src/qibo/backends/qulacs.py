@@ -9,7 +9,7 @@ from qulacs import (
     converter,
 )
 
-from qibo import Circuit, __version__
+from qibo import Circuit, __version__, gates
 from qibo.backends import NumpyBackend
 from qibo.config import raise_error
 from qibo.result import CircuitResult, QuantumState
@@ -58,6 +58,12 @@ class QulacsBackend(NumpyBackend):
         Returns:
             :class:`qibo.result.CircuitResult`: Object storing to the final results.
         """
+        if any(isinstance(gate, gates.ControlFlowOp) for gate in circuit.queue):
+            raise_error(
+                NotImplementedError,
+                "Native Qibo execution of classical control flow is not "
+                + "implemented for the Qulacs backend.",
+            )
         if initial_state is not None:
             raise_error(
                 NotImplementedError,

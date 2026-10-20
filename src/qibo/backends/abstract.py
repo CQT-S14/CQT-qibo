@@ -2686,6 +2686,7 @@ class Backend:
         density_matrix = circuit.density_matrix
 
         self._validate_nqubits(nqubits, density_matrix=density_matrix)
+        has_control_flow = self._validate_control_flow_execution(circuit)
 
         if isinstance(initial_state, type(circuit)):
             if not bool(initial_state.density_matrix == density_matrix):
@@ -2716,6 +2717,9 @@ class Backend:
                     + f"instead of the expected {valid_shape}.",
                 )
 
+        if has_control_flow:
+            self._reset_control_flow_measurements(circuit)
+
         if circuit.repeated_execution:
             if not circuit.measurements and not circuit.has_collapse:
                 raise_error(
@@ -2744,6 +2748,56 @@ class Backend:
             )
 
         return result
+
+    def _validate_control_flow_execution(self, circuit: "Circuit") -> bool:
+        """Validates native classical control flow before backend execution."""
+        from qibo import gates
+
+        operations = [
+            gate for gate in circuit.queue if isinstance(gate, gates.ControlFlowOp)
+        ]
+        if not operations:
+            return False
+
+        if self.name != "numpy":
+            raise_error(
+                NotImplementedError,
+                "Native Qibo execution of classical control flow currently supports "
+                + "only the NumPy backend, but received "
+                + f"{self.name!r}.",
+            )
+        if circuit.accelerators:
+            raise_error(
+                NotImplementedError,
+                "Native Qibo execution of classical control flow is not implemented "
+                + "for distributed circuits.",
+            )
+
+        measured = set()
+        for gate in circuit.queue:
+            if isinstance(gate, gates.M):
+                measured.add(id(gate.result))
+                continue
+            if isinstance(gate, gates.ControlFlowOp):
+                for operation in gate._nested_control_flow():
+                    for result in operation.results:
+                        if id(result) not in measured:
+                            raise_error(
+                                ValueError,
+                                f"Cannot execute {operation.__class__.__name__}: "
+                                + "one of its referenced measurements is not "
+                                + "performed before it in the circuit.",
+                            )
+        return True
+
+    @staticmethod
+    def _reset_control_flow_measurements(circuit: "Circuit") -> None:
+        """Clears outcomes left by earlier executions of the same circuit."""
+        from qibo import gates
+
+        for gate in circuit.queue:
+            if isinstance(gate, gates.M):
+                gate.result.reset()
 
     def execute_circuits(
         self,
