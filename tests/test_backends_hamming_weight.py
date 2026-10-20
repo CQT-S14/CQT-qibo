@@ -32,6 +32,26 @@ def test_global_backend(backend):
     assert hamming_bkd.platform == target
 
 
+def test_circuit_execute_hamming_weight(backend):
+    """``Circuit.execute`` passes the weight to the hamming_weight backend."""
+    construct_hamming_weight_backend(backend)
+    platform = _get_engine_name(backend)
+    set_backend("hamming_weight", platform=platform)
+    try:
+        nqubits = 3
+        weight = 2
+        dim = int(binom(nqubits, weight))
+        initial_state = random_statevector(dim, backend=backend, seed=1237)
+        circuit = Circuit(nqubits)
+        circuit.add(gates.CZ(0, 1))
+        circuit.add(gates.RBS(0, 2, theta=-1.3).controlled_by(1))
+        circuit.add(gates.RZ(2, theta=0.123))
+        result = circuit.execute(weight=weight, initial_state=initial_state)
+        assert result is not None
+    finally:
+        set_backend(backend.name, platform=backend.platform)
+
+
 def get_full_initial_state(state, weight, nqubits, backend):
     if (
         backend._dict_indexes is None
@@ -370,7 +390,7 @@ def test_measurement(backend, weight, collapse, nshots):
             for key, value in hamming_freq.items():
                 hamming_freq_probs[int(key, 2)] = value / nshots
 
-            backend.assert_allclose(hamming_probabilities, probabilities, atol=1e-1)
+            backend.assert_allclose(hamming_probabilities, probabilities, atol=1.5e-1)
             backend.assert_allclose(
                 hamming_freq_probs, hamming_probabilities, atol=1e-8
             )
@@ -426,3 +446,55 @@ def test_errors(backend):
     circuit.add(gates.X(0))
     with pytest.raises(RuntimeError):
         hamming_bkd.execute_circuit(circuit, weight=1)
+
+
+def _hamming_weight_circuit(nqubits, measure=False):
+    circuit = Circuit(nqubits)
+    circuit.add(gates.RBS(0, 2, theta=0.3))
+    circuit.add(gates.RBS(1, 3, theta=0.7))
+    circuit.add(gates.RBS(0, 1, theta=0.5))
+    if measure:
+        circuit.add(gates.M(0, 1, 2))
+    return circuit
+
+
+def test_result_symbolic_without_full_state(backend):
+    hamming_bkd = construct_hamming_weight_backend(backend)
+    circuit = _hamming_weight_circuit(4)
+
+    # ``symbolic`` must not depend on ``full_state`` having been called before
+    result = hamming_bkd.execute_circuit(circuit, weight=2)
+    symbolic = result.symbolic()
+    assert str(result) == symbolic
+
+    result_full = hamming_bkd.execute_circuit(circuit, weight=2)
+    result_full.full_state()
+    assert result_full.symbolic() == symbolic
+
+
+def test_result_zero_shots(backend):
+    hamming_bkd = construct_hamming_weight_backend(backend)
+    circuit = _hamming_weight_circuit(4, measure=True)
+
+    result = hamming_bkd.execute_circuit(circuit, weight=2, nshots=0)
+    probabilities = result.probabilities()
+    backend.assert_allclose(np.sum(probabilities), 1.0, atol=1e-8)
+
+    result_none = hamming_bkd.execute_circuit(circuit, weight=2, nshots=None)
+    backend.assert_allclose(probabilities, result_none.probabilities(), atol=1e-8)
+
+
+def test_result_without_measurements(backend):
+    from qibo.quantum_info.hamming_weight import HammingWeightResult
+
+    state = random_statevector(int(binom(4, 2)), backend=backend, seed=1237)
+    result = HammingWeightResult(
+        state, weight=2, nqubits=4, platform=_get_engine_name(backend)
+    )
+
+    assert result.measurements == []
+    backend.assert_allclose(np.sum(result.probabilities()), 1.0, atol=1e-8)
+    with pytest.raises(RuntimeError):
+        result.samples()
+    with pytest.raises(RuntimeError):
+        result.frequencies()

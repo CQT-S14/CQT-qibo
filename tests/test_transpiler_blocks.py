@@ -1,3 +1,5 @@
+import math
+
 import pytest
 
 from qibo import Circuit, gates
@@ -391,3 +393,91 @@ def test_return_last_block_error():
     # No blocks in the circuit
     with pytest.raises(BlockingError):
         circuit_blocks.return_last_block()
+
+
+def test_kak_decompose(backend):
+    # two-qubit gates cost one controlled-Z gate, except SWAP (three) and iSWAP (two)
+    block = Block(qubits=(2, 5), gates=[gates.SWAP(2, 5), gates.H(5), gates.CNOT(5, 2)])
+    decomposition = block.kak_decompose(backend=backend)
+    assert sum(len(gate.qubits) == 2 for gate in decomposition) == 2
+    assert all(set(gate.qubits) <= {2, 5} for gate in decomposition)
+
+    original = Circuit(6)
+    original.add(block.gates)
+    new = Circuit(6)
+    new.add(decomposition)
+    backend.assert_allclose(new.unitary(backend), original.unitary(backend), atol=1e-8)
+
+
+def test_kak_decompose_identity(backend):
+    block = Block(qubits=(0, 1), gates=[gates.CZ(0, 1), gates.CZ(0, 1)])
+    assert block.kak_decompose(backend=backend) == []
+
+
+def test_kak_decompose_unchanged(backend):
+    for block_gates in (
+        [gates.H(0), gates.X(1)],
+        [gates.H(0), gates.CZ(0, 1), gates.X(1)],
+        [gates.SWAP(0, 1)],
+        [gates.iSWAP(0, 1), gates.RX(0, 0.2)],
+        [gates.RZZ(0, 1, 0.3), gates.RX(1, 0.2), gates.RZZ(0, 1, 0.5)],
+    ):
+        block = Block(qubits=(0, 1), gates=block_gates)
+        assert block.kak_decompose(backend=backend) is block.gates
+
+
+def test_kak_decompose_weight(backend):
+    circuit = Circuit(2)
+    circuit.add([gates.CZ(0, 1), gates.CNOT(0, 1), gates.T(1), gates.SWAP(0, 1)])
+    block = Block(qubits=(0, 1), gates=circuit.queue)
+
+    for kwargs in ({}, {"weight": math.pi}):
+        decomposition = block.kak_decompose(backend=backend, **kwargs)
+        new = Circuit(2)
+        new.add(decomposition)
+        backend.assert_allclose(
+            new.unitary(backend), circuit.unitary(backend), atol=1e-8
+        )
+
+
+def test_count_2q_gates_ignores_barriers():
+    block = Block(qubits=(0, 1), gates=[gates.CZ(0, 1), gates.Barrier(0, 1)])
+    assert block._count_2q_gates() == 1
+    assert block.entangled
+
+    block = Block(qubits=(0, 1), gates=[gates.H(0), gates.Barrier(0, 1)])
+    assert block._count_2q_gates() == 0
+    assert not block.entangled
+
+
+def test_find_successive_gates_stops_at_barrier():
+    gatelist = [gates.H(0), gates.Barrier(0, 1, 2), gates.H(0), gates.H(1)]
+    successive_gates = _find_successive_gates(gatelist, (0, 1))
+    assert_gates_equality(successive_gates, [gatelist[0]])
+
+
+def test_initial_block_decomposition_barrier():
+    circ = Circuit(5)
+    circ.add(gates.H(0))
+    circ.add(gates.CZ(0, 1))
+    circ.add(gates.H(2))
+    circ.add(gates.Barrier(0, 1, 2))
+    circ.add(gates.H(0))
+    circ.add(gates.CZ(2, 3))
+    blocks = _initial_block_decomposition(circ)
+    assert [block.qubits for block in blocks] == [(0, 1), (0, 1, 2), (2, 3)]
+    assert_gates_equality(blocks[0].gates, [gates.H(0), gates.CZ(0, 1)])
+    assert_gates_equality(
+        blocks[1].gates, [gates.H(2), gates.Barrier(0, 1, 2), gates.H(0)]
+    )
+    assert_gates_equality(blocks[2].gates, [gates.CZ(2, 3)])
+    assert [block.entangled for block in blocks] == [True, False, True]
+
+
+def test_block_decomposition_barrier_only():
+    circ = Circuit(4)
+    circ.add(gates.Barrier(0, 1, 2, 3))
+    blocks = block_decomposition(circ)
+    assert len(blocks) == 1
+    assert blocks[0].qubits == (0, 1, 2, 3)
+    assert not blocks[0].entangled

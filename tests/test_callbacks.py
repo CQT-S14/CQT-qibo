@@ -248,7 +248,7 @@ def test_entropy_density_matrix(backend):
     matrix = backend.cast(matrix, dtype=u.dtype)
     rho = backend.matmul(
         backend.matmul(u, backend.diag(5 * matrix)),
-        backend.conj(backend.transpose(u, (1, 0))),
+        backend.dagger(u),
     )
     # this is a positive rho
 
@@ -279,7 +279,7 @@ def test_state_callback(backend, density_matrix, copy):
 
     target_state0 = backend.cast([1, 0, 1, 0]) / float(np.sqrt(2))
     target_state1 = backend.ones(4) / 2.0
-    if not copy and backend.platform == "numba":
+    if not copy and backend.platform in ("numba", "cupy"):
         # when copy is disabled in the callback and in-place updates are used
         target_state0 = target_state1
 

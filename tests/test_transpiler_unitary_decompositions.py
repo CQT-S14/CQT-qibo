@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 import pytest
 from scipy.linalg import expm
@@ -6,6 +8,8 @@ from qibo import Circuit, gates, matrices
 from qibo.quantum_info.linalg_operations import partial_trace
 from qibo.quantum_info.metrics import purity
 from qibo.quantum_info.random_ensembles import random_unitary
+from qibo.transpiler import Optimize1qGatesDecomposition
+from qibo.transpiler._exceptions import DecompositionError
 from qibo.transpiler.unitary_decompositions import (
     bell_basis,
     calculate_h_vector,
@@ -15,6 +19,8 @@ from qibo.transpiler.unitary_decompositions import (
     cnot_decomposition_light,
     magic_basis,
     magic_decomposition,
+    quantum_shannon_decomposition,
+    single_qubit_decomposition,
     to_bell_diagonal,
     two_qubit_decomposition,
 )
@@ -98,11 +104,7 @@ def test_ud_eigenvalues(backend, seed):
     unitary_recon = backend.kron(ua, ub) @ ud @ backend.kron(va, vb)
     backend.assert_allclose(unitary_recon, unitary)
 
-    ud_bell = (
-        backend.transpose(backend.conj(backend.cast(bell_basis)), (1, 0))
-        @ ud
-        @ backend.cast(bell_basis)
-    )
+    ud_bell = backend.dagger(backend.cast(bell_basis)) @ ud @ backend.cast(bell_basis)
     ud_diag = backend.diag(ud_bell)
 
     backend.assert_allclose(backend.diag(ud_diag), ud_bell, atol=1e-6, rtol=1e-6)
@@ -187,6 +189,100 @@ def test_two_qubit_decomposition_bell_unitary(backend, hz_zero):
     backend.assert_allclose(final_matrix, unitary, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.parametrize("seed", [1, 2, 3])
+@pytest.mark.parametrize(
+    "gate_name, ncz",
+    [
+        ("CZ", 1),
+        ("CNOT", 1),
+        ("CY", 1),
+        ("RXX", 1),
+        ("RYY", 1),
+        ("RZZ", 1),
+        ("RZX", 1),
+        ("iSWAP", 2),
+        ("SWAP", 3),
+    ],
+)
+def test_two_qubit_decomposition_cz_count(backend, gate_name, ncz, seed):
+    """Locally equivalent unitaries use the minimal number of CZ gates."""
+    gate = getattr(gates, gate_name)
+    gate = gate(0, 1, math.pi / 2) if gate_name.startswith("R") else gate(0, 1)
+    circuit = Circuit(2)
+    circuit.add(gates.Unitary(random_unitary(2, seed=seed, backend=backend), 0))
+    circuit.add(gates.Unitary(random_unitary(2, seed=seed + 10, backend=backend), 1))
+    circuit.add(gate)
+    circuit.add(gates.Unitary(random_unitary(2, seed=seed + 20, backend=backend), 0))
+    circuit.add(gates.Unitary(random_unitary(2, seed=seed + 30, backend=backend), 1))
+    matrix = circuit.unitary(backend)
+
+    decomposition = two_qubit_decomposition(0, 1, matrix, backend=backend)
+    result = Circuit(2)
+    result.add(decomposition)
+
+    assert sum(isinstance(gate, gates.CZ) for gate in decomposition) == ncz
+    assert all(
+        len(gate.qubits) == 1 or isinstance(gate, gates.CZ) for gate in decomposition
+    )
+    backend.assert_allclose(result.unitary(backend), matrix, atol=1e-6)
+
+
+@pytest.mark.parametrize("seed", [5, 70, 298])
+def test_two_qubit_decomposition_iswap_hz_modulo_pi(backend, seed):
+    """The ``hz`` component of iSWAP can be a multiple of pi, which is a global phase.
+
+    The eigenvectors of the magic decomposition are degenerate for iSWAP, so the
+    representative of ``hz`` depends on the linear algebra library. For these seeds it
+    is pi with the default LAPACK, and the decomposition must still use two CZ gates.
+    """
+    circuit = Circuit(2)
+    circuit.add(gates.Unitary(random_unitary(2, seed=seed, backend=backend), 0))
+    circuit.add(gates.Unitary(random_unitary(2, seed=seed + 10, backend=backend), 1))
+    circuit.add(gates.iSWAP(0, 1))
+    circuit.add(gates.Unitary(random_unitary(2, seed=seed + 20, backend=backend), 0))
+    circuit.add(gates.Unitary(random_unitary(2, seed=seed + 30, backend=backend), 1))
+    matrix = circuit.unitary(backend)
+
+    decomposition = two_qubit_decomposition(0, 1, matrix, backend=backend)
+    result = Circuit(2)
+    result.add(decomposition)
+
+    assert sum(isinstance(gate, gates.CZ) for gate in decomposition) == 2
+    backend.assert_allclose(result.unitary(backend), matrix, atol=1e-6)
+
+
+@pytest.mark.parametrize("seed", [None, 5])
+def test_two_qubit_decomposition_product_of_single_qubit_gates(backend, seed):
+    """A tensor product of single-qubit gates, with its phase, needs no CZ gate."""
+    matrix = backend.kron(
+        random_unitary(2, seed=seed, backend=backend),
+        random_unitary(2, seed=None if seed is None else seed + 1, backend=backend),
+    )
+    matrix = matrix * np.exp(0.3j)
+
+    decomposition = two_qubit_decomposition(0, 1, matrix, backend=backend)
+    result = Circuit(2)
+    result.add(decomposition)
+
+    assert [len(gate.qubits) for gate in decomposition] == [1, 1]
+    backend.assert_allclose(result.unitary(backend), matrix, atol=1e-6)
+
+
+def test_two_qubit_decomposition_near_cz_uses_two_cz(backend):
+    """A small but resolvable deviation from CZ is not rounded to a single CZ gate."""
+    circuit = Circuit(2)
+    circuit.add(gates.CZ(0, 1))
+    circuit.add(gates.RXX(0, 1, 1e-3))
+    matrix = circuit.unitary(backend)
+
+    decomposition = two_qubit_decomposition(0, 1, matrix, backend=backend)
+    result = Circuit(2)
+    result.add(decomposition)
+
+    assert sum(isinstance(gate, gates.CZ) for gate in decomposition) == 2
+    backend.assert_allclose(result.unitary(backend), matrix, atol=1e-6)
+
+
 def test_two_qubit_decomposition_no_entanglement(backend):
     """Test two-qubit decomposition on unitary that creates no entanglement."""
     matrix = np.array(
@@ -204,3 +300,195 @@ def test_two_qubit_decomposition_no_entanglement(backend):
     final_matrix = circuit.unitary(backend)
 
     backend.assert_allclose(final_matrix, matrix, atol=1e-6, rtol=1e-6)
+
+
+def test_two_qubit_decomposition_structured_angles(backend):
+    """Test decomposition of a unitary whose eigenvalue angles are multiples of pi/4."""
+    circuit = Circuit(2)
+    circuit.add(gates.CZ(0, 1))
+    circuit.add(gates.CNOT(0, 1))
+    circuit.add(gates.T(1))
+    matrix = circuit.unitary(backend)
+
+    decomposition = Circuit(2)
+    decomposition.add(two_qubit_decomposition(0, 1, matrix, backend=backend))
+
+    backend.assert_allclose(decomposition.unitary(backend), matrix, atol=1e-6)
+
+
+@pytest.mark.parametrize("weight", [math.sqrt(2), math.pi, 0.3])
+def test_two_qubit_decomposition_weight(backend, weight):
+    circuit = Circuit(2)
+    circuit.add(gates.CZ(0, 1))
+    circuit.add(gates.CNOT(0, 1))
+    circuit.add(gates.T(1))
+    matrix = circuit.unitary(backend)
+
+    decomposition = Circuit(2)
+    decomposition.add(
+        two_qubit_decomposition(0, 1, matrix, backend=backend, weight=weight)
+    )
+
+    backend.assert_allclose(decomposition.unitary(backend), matrix, atol=1e-6)
+
+
+def test_calculate_psi_weight(backend):
+    unitary = random_unitary(4, backend=backend)
+    for weight in (math.sqrt(2), 2.0):
+        states, eigvals = calculate_psi(unitary, backend=backend, weight=weight)
+        magic = backend.cast(magic_basis)
+        u_magic = backend.conj(magic).T @ unitary @ magic
+        backend.assert_allclose(
+            u_magic.T @ u_magic @ backend.conj(magic).T @ states,
+            backend.conj(magic).T @ states * eigvals,
+            atol=1e-8,
+        )
+
+
+@pytest.mark.parametrize(
+    "gate_classes",
+    [
+        (gates.RX, gates.RZ),
+        (gates.RY, gates.RZ),
+        (gates.RX, gates.RY),
+        (gates.RX, gates.RY, gates.RZ),
+        (gates.RZ, gates.H),
+        (gates.RX, gates.H),
+        (gates.RZ, gates.SX),
+        (gates.RZ, gates.SXDG),
+        (gates.RX, gates.S),
+        (gates.RX, gates.T),
+        (gates.RZ, gates.H, gates.T),
+        (gates.PRX,),
+    ],
+)
+def test_single_qubit_decomposition(backend, gate_classes):
+    for seed in range(10):
+        unitary = random_unitary(2, seed=seed, backend=backend)
+        decomposition = single_qubit_decomposition(
+            unitary, 1, gate_classes, backend=backend
+        )
+        assert all(type(gate) in gate_classes for gate in decomposition)
+        assert all(gate.qubits == (1,) for gate in decomposition)
+
+        circuit = Circuit(2)
+        circuit.add(decomposition)
+        result = backend.to_numpy(circuit.unitary(backend))[:2, :2]
+        target = backend.to_numpy(unitary)
+        overlap = np.abs(np.trace(target.conj().T @ result)) / 2
+        backend.assert_allclose(overlap, 1.0, atol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "gate_classes",
+    [(gates.RX, gates.RZ), (gates.RZ, gates.H), (gates.RZ, gates.SX), (gates.PRX,)],
+)
+def test_single_qubit_decomposition_special_unitaries(backend, gate_classes):
+    # The identity needs no gates, and the Pauli gates are special cases of the rotations
+    identity = backend.matrices.I(2)
+    assert single_qubit_decomposition(identity, 0, gate_classes, backend=backend) == []
+    for gate in (gates.X(0), gates.Y(0), gates.Z(0), gates.H(0), gates.T(0)):
+        circuit = Circuit(1)
+        circuit.add(
+            single_qubit_decomposition(
+                gate.matrix(backend), 0, gate_classes, backend=backend
+            )
+        )
+        result = backend.to_numpy(circuit.unitary(backend))
+        target = backend.to_numpy(gate.matrix(backend))
+        overlap = np.abs(np.trace(target.conj().T @ result)) / 2
+        backend.assert_allclose(overlap, 1.0, atol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "gate_classes",
+    [
+        (),
+        (gates.RZ,),
+        (gates.RX,),
+        (gates.RZ, gates.X),
+        (gates.RZ, gates.T),
+        (gates.H, gates.T),
+    ],
+)
+def test_single_qubit_decomposition_error(backend, gate_classes):
+    with pytest.raises(DecompositionError):
+        single_qubit_decomposition(backend.matrices.X, 0, gate_classes, backend=backend)
+
+
+@pytest.mark.parametrize(
+    "gate_classes,maximum",
+    [
+        ((gates.RZ, gates.RY), 3),
+        ((gates.RZ, gates.RX), 3),
+        ((gates.RX, gates.RY), 3),
+        ((gates.RZ, gates.SX), 5),
+        ((gates.RZ, gates.SX, gates.X), 5),
+        ((gates.U3,), 1),
+    ],
+)
+def test_single_qubit_decomposition_euler_bases(backend, gate_classes, maximum):
+    """The Euler bases are shared with the single-qubit optimizer, which gives the same gates."""
+    names = [gate_class.__name__.lower() for gate_class in gate_classes]
+    for seed in range(10):
+        unitary = random_unitary(2, seed=seed, backend=backend)
+        decomposition = single_qubit_decomposition(
+            unitary, 0, gate_classes, backend=backend
+        )
+        assert len(decomposition) <= maximum
+
+        circuit = Circuit(1)
+        circuit.add(gates.Unitary(unitary, 0))
+        optimized = Optimize1qGatesDecomposition(basis=names)(circuit, backend=backend)
+        assert [gate.name for gate in optimized.queue] == [
+            gate.name for gate in decomposition
+        ]
+        for gate, optimized_gate in zip(decomposition, optimized.queue):
+            backend.assert_allclose(gate.parameters, optimized_gate.parameters)
+
+
+@pytest.mark.parametrize("nqubits", [2, 3, 4])
+def test_quantum_shannon_decomposition(backend, nqubits):
+    qubits = (3, 0, 2, 4)[:nqubits]
+    unitary = random_unitary(2**nqubits, seed=nqubits, backend=backend)
+    decomposition = quantum_shannon_decomposition(qubits, unitary, backend=backend)
+
+    # the unitaries act on the last qubits, and the multiplexed rotations are
+    # controlled by them, with the first qubit as target
+    assert [type(gate) for gate in decomposition] == [
+        gates.Unitary,
+        gates.Multiplexor,
+        gates.Unitary,
+        gates.Multiplexor,
+        gates.Unitary,
+        gates.Multiplexor,
+        gates.Unitary,
+    ]
+    for gate in decomposition[::2]:
+        assert gate.qubits == qubits[1:]
+    for gate in decomposition[1::2]:
+        assert gate.qubits == qubits[1:] + qubits[:1]
+    assert [gate.init_kwargs["axis"] for gate in decomposition[1::2]] == ["z", "y", "z"]
+
+    nqubits_circuit = max(qubits) + 1
+    circuit = Circuit(nqubits_circuit)
+    circuit.add(decomposition)
+    target = Circuit(nqubits_circuit)
+    target.add(gates.Unitary(unitary, *qubits))
+    result, target = circuit.unitary(backend), target.unitary(backend)
+    phase = backend.dot(backend.ravel(backend.conj(target)), backend.ravel(result))
+    backend.assert_allclose(
+        result * backend.conj(phase / abs(phase)), target, atol=1e-10
+    )
+
+
+@pytest.mark.parametrize(
+    "qubits, dims",
+    [((0,), 2), ((0, 1, 2), 4), ((0, 1), 8)],
+    ids=["one-qubit", "small", "large"],
+)
+def test_quantum_shannon_decomposition_error(backend, qubits, dims):
+    with pytest.raises(ValueError):
+        quantum_shannon_decomposition(
+            qubits, random_unitary(dims, backend=backend), backend=backend
+        )

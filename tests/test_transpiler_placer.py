@@ -1,11 +1,11 @@
 import networkx as nx
 import pytest
 
-from qibo import gates
-from qibo.models import Circuit
+from qibo import Circuit, gates
 from qibo.transpiler._exceptions import ConnectivityError, PlacementError
-from qibo.transpiler.asserts import assert_placement
-from qibo.transpiler.pipeline import restrict_connectivity_qubits
+from qibo.transpiler.asserts import assert_placement, assert_transpiling
+from qibo.transpiler.optimizer import Preprocessing
+from qibo.transpiler.pipeline import Passes, restrict_connectivity_qubits
 from qibo.transpiler.placer import (
     Random,
     ReverseTraversal,
@@ -13,7 +13,8 @@ from qibo.transpiler.placer import (
     Subgraph,
     _find_gates_qubits_pairs,
 )
-from qibo.transpiler.router import ShortestPaths
+from qibo.transpiler.router import Sabre, ShortestPaths
+from qibo.transpiler.unroller import NativeGates, Unroller
 
 
 def star_circuit(names=None):
@@ -201,6 +202,17 @@ def test_star_connectivity_placer_error(first, star_connectivity):
         placer(circ)
 
 
+def test_star_connectivity_placer_wrong_node_count(star_connectivity):
+    """StarConnectivityPlacer raises when the graph does not have 5 nodes."""
+    chip = nx.Graph()
+    chip.add_edges_from([(0, 1), (1, 2), (2, 3)])  # 4 nodes
+    circ = Circuit(4)
+    circ.add(gates.CZ(0, 1))
+    placer = StarConnectivityPlacer(chip)
+    with pytest.raises(ConnectivityError):
+        placer(circ)
+
+
 def test_star_connectivity_plus_disconnected_edges(star_connectivity):
     connectivity = star_connectivity()
     connectivity.add_edge(5, 6)
@@ -216,3 +228,99 @@ def test_incorrect_star_connectivity(star_connectivity):
     error_msg = "This connectivity graph is not a star graph. There is a node with degree different from 1 and 4."
     with pytest.raises(ConnectivityError, match=error_msg):
         placer(Circuit(5))
+
+
+@pytest.mark.parametrize("placer_class", [Random, StarConnectivityPlacer, Subgraph])
+def test_placer_backend_argument(backend, placer_class, star_connectivity):
+    connectivity = star_connectivity()
+    circuit = star_circuit()
+    placer_class(connectivity=connectivity)(circuit, backend=backend)
+    assert_placement(circuit, connectivity)
+
+
+@pytest.mark.parametrize("placer_class", [StarConnectivityPlacer, Subgraph])
+def test_placer_in_passes(backend, placer_class, star_connectivity):
+    connectivity = star_connectivity()
+    circuit = star_circuit()
+    passes = Passes(
+        passes=[
+            Preprocessing(),
+            placer_class(),
+            Sabre(seed=0),
+            Unroller(native_gates=NativeGates.default(), backend=backend),
+        ],
+        connectivity=connectivity,
+        native_gates=NativeGates.default(),
+    )
+    transpiled_circuit, final_layout = passes(circuit, backend=backend)
+    assert_transpiling(
+        original_circuit=circuit,
+        transpiled_circuit=transpiled_circuit,
+        connectivity=connectivity,
+        final_layout=final_layout,
+    )
+
+
+def test_random_zero_samples(star_connectivity):
+    connectivity = star_connectivity(["A", "B", "C", "D", "E"])
+    circuit = star_circuit(["E", "D", "C", "B", "A"])
+    Random(connectivity=connectivity, samples=0)(circuit)
+    assert circuit.wire_names == ["A", "B", "C", "D", "E"]
+    assert_placement(circuit, connectivity)
+
+
+def test_gates_qubits_pairs_ignore_barriers():
+    circuit = Circuit(5)
+    circuit.add(gates.CNOT(0, 1))
+    circuit.add(gates.Barrier(0, 1, 2))
+    circuit.add(gates.Barrier(3, 4))
+    circuit.add(gates.CNOT(1, 2))
+    assert _find_gates_qubits_pairs(circuit) == [[0, 1], [1, 2]]
+
+
+@pytest.mark.parametrize("barrier_qubits", [(0, 1, 2), (0, 1, 2, 3, 4), (0, 4)])
+def test_star_connectivity_placer_barrier(barrier_qubits, star_connectivity):
+    circ = Circuit(5)
+    circ.add(gates.Barrier(*barrier_qubits))
+    circ.add(gates.CZ(0, 1))
+    circ.add(gates.Barrier(*barrier_qubits))
+    circ.add(gates.CZ(1, 2))
+    circ.add(gates.CZ(0, 2))
+    connectivity = star_connectivity()
+    placer = StarConnectivityPlacer(connectivity)
+    placer(circ)
+    assert_placement(circ, connectivity)
+    assert circ.wire_names == [0, 2, 1, 3, 4]
+
+
+@pytest.mark.parametrize("placer_class", [Random, Subgraph])
+def test_placers_with_barrier(placer_class, star_connectivity):
+    circ = star_circuit()
+    circ.add(gates.Barrier(0, 1, 2, 3))
+    connectivity = star_connectivity()
+    placer = placer_class(connectivity=connectivity)
+    placer(circ)
+    assert_placement(circ, connectivity)
+
+
+@pytest.mark.parametrize(
+    "placer_class",
+    [
+        Random,
+        Subgraph,
+        StarConnectivityPlacer,
+        lambda connectivity=None: ReverseTraversal(Sabre(), connectivity),
+    ],
+    ids=["Random", "Subgraph", "StarConnectivityPlacer", "ReverseTraversal"],
+)
+def test_placers_store_undirected_connectivity(placer_class, star_connectivity):
+    assert placer_class().connectivity is None
+    undirected = star_connectivity()
+    assert placer_class(undirected).connectivity is undirected
+    directed = nx.DiGraph(undirected.edges)
+    placer = placer_class(directed)
+    assert not placer.connectivity.is_directed()
+    assert set(map(frozenset, placer.connectivity.edges)) == set(
+        map(frozenset, undirected.edges)
+    )
+    assert directed.is_directed()

@@ -60,6 +60,47 @@ def test_clifford_from_circuit(backend, measurement):
         backend.assert_allclose(obj.probabilities(), result.probabilities())
 
 
+def test_clifford_probabilities_unmeasured_qubit(backend):
+    """``probabilities`` raises when asking for a qubit that was not measured."""
+    clifford_backend = construct_clifford_backend(backend)
+    if not clifford_backend:
+        pytest.skip("Clifford backend not available for this engine.")
+    circuit = random_clifford(3, backend=backend)
+    circuit.add(gates.M(0))  # measure only qubit 0
+    obj = Clifford.from_circuit(circuit, platform=_get_engine_name(backend))
+    with pytest.raises(RuntimeError):
+        obj.probabilities(qubits=(1,))
+
+
+def test_cnot_cost_two_qubit(backend):
+    """``_cnot_cost`` works for 2-qubit Cliffords (exercises ``_cnot_cost2``)."""
+    clifford_backend = construct_clifford_backend(backend)
+    if not clifford_backend:
+        pytest.skip("Clifford backend not available for this engine.")
+    platform = _get_engine_name(backend)
+    # A CNOT has r00 == 2, exercising the ``if r00 == 2: return r01`` branch.
+    circuit = Circuit(2)
+    circuit.add(gates.CNOT(0, 1))
+    obj = Clifford.from_circuit(circuit, platform=platform)
+    assert _cnot_cost(obj) == 1
+    # A SWAP has r00 == 0, exercising the ``return r01 + 1 - r00`` branch.
+    circuit = Circuit(2)
+    circuit.add(gates.SWAP(0, 1))
+    obj = Clifford.from_circuit(circuit, platform=platform)
+    assert _cnot_cost(obj) == 3
+
+
+def test_cnot_cost_too_many_qubits(backend):
+    """``_cnot_cost`` raises for more than 3 qubits."""
+    clifford_backend = construct_clifford_backend(backend)
+    if not clifford_backend:
+        pytest.skip("Clifford backend not available for this engine.")
+    circuit = random_clifford(4, backend=backend)
+    obj = Clifford.from_circuit(circuit, platform=_get_engine_name(backend))
+    with pytest.raises(ValueError):
+        _cnot_cost(obj)
+
+
 @pytest.mark.parametrize("seed", [1, 10])
 @pytest.mark.parametrize("algorithm", ["AG04", "BM20"])
 @pytest.mark.parametrize("nqubits", [1, 3, 10])
@@ -89,9 +130,6 @@ def test_clifford_to_circuit(backend, nqubits, algorithm, seed):
             )
         with pytest.raises(ValueError):
             _cnot_cost(symplectic_matrix_compiled)
-    elif algorithm == "AG04" and platform == "cupy":
-        with pytest.raises(NotImplementedError):
-            symplectic_matrix_from_symplectic.to_circuit(algorithm=algorithm)
     else:
         with pytest.raises(TypeError):
             symplectic_matrix_compiled.to_circuit(algorithm=True)
@@ -377,7 +415,7 @@ def test_one_qubit_paulis_string_product(pauli_1, pauli_2):
         "ZX": "iY",
         "YX": "-iZ",
         "ZY": "-iX",
-        "XZ": "iY",
+        "XZ": "-iY",
         "XX": "I",
         "ZZ": "I",
         "YY": "I",
@@ -399,7 +437,7 @@ def test_one_qubit_paulis_string_product(pauli_1, pauli_2):
     ["operators", "target"],
     [
         [["X", "Y", "Z"], "iI"],
-        [["Z", "X", "Y", "X", "Z"], "-Y"],
+        [["Z", "X", "Y", "X", "Z"], "Y"],
         [["Z", "I", "Z"], "I"],
         [["Y", "X"], "-iZ"],
         [["iY", "iX"], "iZ"],
@@ -412,3 +450,49 @@ def test_string_product(operators, target):
 
 def test_1q_paulis_string_product():
     assert "-iZ" == _one_qubit_paulis_string_product("iX", "iY")
+
+
+@pytest.mark.parametrize("from_matrix", [False, True])
+def test_clifford_no_measurements(backend, from_matrix):
+    construct_clifford_backend(backend)
+    platform = _get_engine_name(backend)
+
+    circuit = Circuit(2)
+    circuit.add(gates.H(0))
+    circuit.add(gates.CNOT(0, 1))
+    clifford = Clifford.from_circuit(circuit, platform=platform)
+    if from_matrix:
+        clifford = Clifford(clifford.symplectic_matrix, platform=platform)
+
+    for method in (clifford.samples, clifford.frequencies, clifford.probabilities):
+        with pytest.raises(RuntimeError, match="No measurement provided"):
+            method()
+    with pytest.raises(RuntimeError, match="No measurement provided"):
+        _ = clifford.measurement_gate
+
+
+def test_clifford_samples_binary_flag(backend):
+    construct_clifford_backend(backend)
+
+    nshots = 20
+    circuit = Circuit(3)
+    circuit.add(gates.H(0))
+    circuit.add(gates.CNOT(0, 1))
+    circuit.add(gates.M(0, 1, 2))
+    clifford = Clifford.from_circuit(
+        circuit, nshots=nshots, platform=_get_engine_name(backend)
+    )
+
+    assert tuple(clifford.samples(binary=True).shape) == (nshots, 3)
+    assert tuple(clifford.samples(binary=False).shape) == (nshots,)
+
+
+def test_clifford_from_circuit_does_not_modify_class(backend):
+    construct_clifford_backend(backend)
+
+    circuit = Circuit(1)
+    circuit.add(gates.H(0))
+    Clifford.from_circuit(circuit, platform=_get_engine_name(backend))
+    Clifford(circuit, platform=_get_engine_name(backend))
+
+    assert Clifford.__dict__["_backend"] is None

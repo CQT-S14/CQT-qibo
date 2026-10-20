@@ -231,6 +231,24 @@ class Backend:
         """
         return self.engine.complex128
 
+    def create_dtype(self, dtype: DTypeLike | str | tuple, **kwargs) -> DTypeLike:
+        """Create a data type object.
+
+        .. note::
+            This is not named ``dtype`` because :attr:`Backend.dtype` already stores the
+            default data type of arrays created using the backend.
+
+        Args:
+            dtype (DTypeLike or str or tuple): object to be converted to a data type object,
+                e.g. ``"uint8"``, or ``"V3"`` for a raw-bytes (void) type of :math:`3` bytes.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            DTypeLike: The data type object.
+        """
+        return self.engine.dtype(dtype, **kwargs)
+
     @property
     def float32(self) -> DTypeLike:
         """Single-precision floating-point number type.
@@ -456,18 +474,33 @@ class Backend:
         """
         return self.engine.arctan2(array_1, array_2, **kwargs)
 
+    def argmax(self, array: ArrayLike, axis: int | None = None, **kwargs) -> ArrayLike:
+        """Return the indices of the maximum values in ``array`` along an ``axis``.
+
+        Args:
+            array (ArrayLike): input array.
+            axis (Optional[int], optional): axis along which to find the maximum value(s).
+                If ``None``, the flattened ``array`` is used. Defaults to ``None``.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            ArrayLike: Array of indices into the ``array``.
+        """
+        return self.engine.argmax(array, axis, **kwargs)
+
     def argsort(self, array: ArrayLike, axis: int | None = None, **kwargs) -> ArrayLike:
         """Return the indices that would sort ``array``.
 
         Args:
-            array (ArrayLike): _description_
+            array (ArrayLike): input array.
             axis (Optional[int], optional): axis along which to sort. If ``None``,
                 the flattened ``array`` is used. Defaults to ``None``.
             kwargs (optional): additional options for this function.
                 For more details, see the corresponding engine's documentation.
 
         Returns:
-            ArrayLike: _description_
+            ArrayLike: Array of indices that sort ``array`` along the specified axis.
         """
         return self.engine.argsort(array, axis, **kwargs)
 
@@ -497,6 +530,44 @@ class Backend:
             ArrayLike: Contiguous array of same shape and content as ``array``.
         """
         return self.engine.ascontiguousarray(array, **kwargs)
+
+    def base_repr(self, number: int, base: int = 2, **kwargs) -> str:
+        """Return a string representation of a ``number`` in the given ``base`` system.
+
+        .. note::
+            If ``base==2``, function defaults to the faster
+            :meth:`qibo.backends.abstract.Backend.binary_repr`.
+            See that method's documentation for more options.
+
+        Args:
+            number (int): value to convert.
+            base (int, optional): Base system to convert ``number``. Ranges from :math:`2`
+                to :math:`36`. Defaults to :math:`2`.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            str: String representation of ``number`` in the ``base`` system.
+        """
+        if base == 2:
+            length = kwargs.get("length", None)
+            return self.binary_repr(number, length)
+
+        return self.engine.base_repr(number, base, **kwargs)
+
+    def binary_repr(self, number: int, length: int | None = None) -> str:
+        """Return the binary representation of the input number as a string.
+
+        Args:
+            number (int): value to convert.
+            length (int | None, optional): The length of the returned string if ``number``
+                is positive. The length of the two's complement if ``number`` is negative.
+                If ``None``, defaults to the shortest length possible. Defaults to ``None``.
+
+        Returns:
+            str: Binary representation of ``number``.
+        """
+        return self.engine.binary_repr(number, length)
 
     def block(self, arrays: ArrayLike) -> ArrayLike:  # pragma: no cover
         """Assemble an array from a nested list of blocks of ``arrays``.
@@ -557,6 +628,20 @@ class Backend:
         """
         return self.engine.conj(array)
 
+    def convolve(self, array_1: ArrayLike, array_2: ArrayLike, **kwargs) -> ArrayLike:
+        """Return the discrete, linear convolution of two one-dimensional arrays.
+
+        Args:
+            array_1 (ArrayLike): first one-dimensional array.
+            array_2 (ArrayLike): second one-dimensional array.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            ArrayLike: Discrete, linear convolution of ``array_1`` and ``array_2``.
+        """
+        return self.engine.convolve(array_1, array_2, **kwargs)
+
     def coo_matrix(self, array: ArrayLike, **kwargs) -> ArrayLike:  # pragma: no cover
         """Return the sparse version of ``array`` in coordinate format.
 
@@ -598,6 +683,22 @@ class Backend:
         """
         return self.engine.cos(array, **kwargs)
 
+    def cosine_sin_decomposition(
+        self, array: ArrayLike, block_nrows: int, block_ncols: int
+    ) -> tuple[ArrayLike, ArrayLike, ArrayLike]:  # pragma: no cover
+        """Calculate the Cosine-Sine Decomposition of a unitary ``array``.
+
+        Args:
+            array (ArrayLike): unitary matrix to be decomposed.
+            block_nrows (int): number of rows of the upper left block of ``array``.
+            block_ncols (int): number of columns of the upper left block of ``array``.
+
+        Returns:
+            Tuple[ArrayLike, ArrayLike, ArrayLike]: Block-diagonal left unitary,
+            cosine-sine matrix, and block-diagonal right unitary, in that order.
+        """
+        raise_error(NotImplementedError)
+
     def count_nonzero(self, array: ArrayLike, **kwargs) -> ArrayLike:
         """Count the number of non-zero elements in ``array``.
 
@@ -636,6 +737,17 @@ class Backend:
             ArrayLike: New array with the cumulative sum of ``array``.
         """
         return self.engine.cumsum(array, **kwargs)
+
+    def dagger(self, array: ArrayLike) -> ArrayLike:
+        """Return the conjugate transpose of an ``array``.
+
+        Args:
+            array (ArrayLike): input array.
+
+        Returns:
+            ArrayLike: Conjugate transpose of the input ``array``.
+        """
+        return self.transpose(self.conj(array))
 
     def default_rng(self, seed: int | None = None) -> ArrayLike:
         """Create a new random number Generator using the engine's default setting.
@@ -847,6 +959,20 @@ class Backend:
         """
         raise_error(NotImplementedError)
 
+    def fft(self, array: ArrayLike, **kwargs) -> ArrayLike:
+        """Compute the one-dimensional discrete Fourier transform (DFT)
+        of ``array`` with the fast Fourier transform (FFT) algorithm.
+
+        Args:
+            array (ArrayLike): input array.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            ArrayLike: The transformed array.
+        """
+        return self.engine.fft.fft(array, **kwargs)
+
     def flatnonzero(self, array: ArrayLike) -> ArrayLike:
         """Return indices that are non-zero in the flattened version of ``array``.
 
@@ -885,6 +1011,19 @@ class Backend:
             ArrayLike: The floor of each element in ``array``.
         """
         return self.engine.floor(array, **kwargs)
+
+    def frombuffer(self, buffer: bytes, **kwargs) -> ArrayLike:
+        """Interpret ``buffer`` as a one-dimensional array.
+
+        Args:
+            buffer (bytes): object exposing the buffer interface, e.g. ``bytes``.
+            kwargs (optional): additional options for this function, e.g. ``dtype``.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            ArrayLike: One-dimensional array created from the contents of ``buffer``.
+        """
+        return self.engine.frombuffer(buffer, **kwargs)
 
     def full(
         self,
@@ -945,6 +1084,20 @@ class Backend:
             if sparse
             else self.engine.eye(dims, dtype=dtype, **kwargs)
         )
+
+    def ifft(self, array: ArrayLike, **kwargs) -> ArrayLike:
+        """Compute the one-dimensional inverse discrete Fourier transform
+        of ``array`` with the inverse fast Fourier transform algorithm.
+
+        Args:
+            array (ArrayLike): input array.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            ArrayLike: The inversely transformed array.
+        """
+        return self.engine.fft.ifft(array, **kwargs)
 
     def imag(self, array: ArrayLike) -> int | float | ArrayLike:
         """Return the element-wise imaginary part of a complex-valued ``array``.
@@ -1234,6 +1387,40 @@ class Backend:
             ArrayLike: The resulting array.
         """
         return self.engine.outer(array_1, array_2)
+
+    def packbits(
+        self, array: ArrayLike, axis: int | None = None, **kwargs
+    ) -> ArrayLike:
+        """Pack the elements of a binary-valued ``array`` into bits of an unsigned integer array.
+
+        Args:
+            array (ArrayLike): array of integers or booleans, whose elements are interpreted
+                as bits according to their truth value.
+            axis (int, optional): axis along which the bits are packed. If ``None``,
+                ``array`` is flattened before packing. Defaults to ``None``.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            ArrayLike: Array of :math:`8`-bit unsigned integers, in which every :math:`8`
+            consecutive elements of ``array`` along ``axis`` are packed into a single element,
+            with zero padding if the size of ``axis`` is not a multiple of :math:`8`.
+        """
+        return self.engine.packbits(array, axis=axis, **kwargs)
+
+    def poly(self, array: ArrayLike, **kwargs) -> ArrayLike:  # pragma: no cover
+        """Return the coefficients of the polynomial with the given roots.
+
+        Args:
+            array (ArrayLike): roots of the polynomial, or a square matrix
+                whose eigenvalues are the roots.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            ArrayLike: Polynomial coefficients, from the highest to the lowest degree.
+        """
+        raise_error(NotImplementedError)
 
     def prod(self, array: ArrayLike, **kwargs) -> ArrayLike:
         """Return the product of array elements.
@@ -1546,6 +1733,20 @@ class Backend:
         """
         return self.engine.roll(array, shift, **kwargs)
 
+    def roots(self, array: ArrayLike, **kwargs) -> ArrayLike:  # pragma: no cover
+        """Return the roots of a polynomial given its coefficients.
+
+        Args:
+            array (ArrayLike): polynomial coefficients, from the highest to the
+                lowest degree.
+            kwargs (optional): additional options for this function.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            ArrayLike: Roots of the polynomial.
+        """
+        raise_error(NotImplementedError)
+
     def round(self, array: ArrayLike, decimals: int = 0, **kwargs) -> ArrayLike:
         """Return element-wise evenly round ``array`` to the given number of ``decimals``.
 
@@ -1559,6 +1760,28 @@ class Backend:
             ArrayLike: The rounded array.
         """
         return self.engine.round(array, decimals, **kwargs)
+
+    def schur(
+        self, array: ArrayLike, **kwargs
+    ) -> tuple[ArrayLike, ArrayLike]:  # pragma: no cover
+        """Compute the Schur decomposition of a square ``array``.
+
+        The Schur decomposition of a matrix :math:`A` is :math:`A = Z \\, T \\, Z^{\\dagger}`,
+        where :math:`Z` is unitary and :math:`T` is upper triangular, if the complex form
+        is requested. If :math:`A` is normal, which is the case of unitary matrices,
+        :math:`T` is diagonal.
+
+        Args:
+            array (ArrayLike): square input array.
+            kwargs (optional): additional options for this function, such as
+                ``output="complex"`` to obtain the complex Schur form for real ``array``.
+                For more details, see the corresponding engine's documentation.
+
+        Returns:
+            Tuple[ArrayLike, ArrayLike]: Schur form :math:`T` and unitary matrix
+            :math:`Z`, in that order.
+        """
+        raise_error(NotImplementedError)
 
     def searchsorted(
         self, array_1: ArrayLike, array_2: ArrayLike, **kwargs
@@ -1590,18 +1813,27 @@ class Backend:
         """
         self.engine.random.shuffle(array, **kwargs)
 
-    def sign(self, array: ArrayLike, **kwargs) -> ArrayLike:  # pragma: no cover
+    def sign(
+        self, array: ArrayLike, nonzero: bool = False, **kwargs
+    ) -> ArrayLike:  # pragma: no cover
         """Return an element-wise indication of the sign of a number.
 
         Args:
             array (ArrayLike): input array.
+            nonzero (bool, optional): if ``True`` and sign is :math:`0.0`, returns :math:`1.0`.
+                If ``False`` and sign is :math:`0.0`, returns :math:`0.0`. Defaults to ``False``.
             kwargs (optional): additional options for this function.
                 For more details, see the corresponding engine's documentation.
 
         Returns:
             ArrayLike: The resulting array with signs of the elements in ``array``.
         """
-        return self.engine.sign(array, **kwargs)
+        sign = self.engine.sign(array, **kwargs)
+
+        if nonzero:
+            sign = self.where(sign == 0, 1, sign)
+
+        return sign
 
     def sin(self, array: ArrayLike, **kwargs) -> ArrayLike:  # pragma: no cover
         """Calculate the element-wise sine of values in ``array``.
@@ -2666,6 +2898,8 @@ class Backend:
             )
         elif name == "FanOut":
             _matrix = _matrix(*gate.init_args)
+        elif name == "Multiplexor":
+            _matrix = _matrix(angles=gate.parameters[0], axis=gate.init_kwargs["axis"])
         else:
             _matrix = _matrix(*gate.parameters)
 

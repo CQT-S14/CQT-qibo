@@ -1,9 +1,12 @@
 """Tests for quantum_info.quantum_networks submodule"""
 
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 
 from qibo import gates
+from qibo.backends import construct_backend
 from qibo.quantum_info.quantum_networks import (
     IdentityChannel,
     QuantumChannel,
@@ -88,6 +91,10 @@ def test_errors(backend):
 
     with pytest.raises(TypeError):
         network * "1"
+
+    # ``_run_checks`` rejects a partition that is neither a list nor a tuple.
+    with pytest.raises(TypeError):
+        network._run_checks("not a partition", None, False)
 
     with pytest.raises(TypeError):
         network / "1"
@@ -518,3 +525,126 @@ def test_default_construction(backend):
     channel5 = QuantumChannel(tensor, pure=False, backend=backend)
     assert channel5.partition == (2, 2)
     assert channel5.system_input == (True, False)
+
+
+def test_operator_to_tensor_torch(backend):
+    """Test ``_operator_to_tensor`` with a mock torch Tensor."""
+
+    # Create a mock Tensor class with reshape and permute methods
+    class Tensor:
+        def __init__(self, data):
+            self._data = data
+            self.shape = data.shape
+
+        def reshape(self, shape):
+            return Tensor(self._data.reshape(shape))
+
+        def permute(self, order):
+            return Tensor(self._data.transpose(order))
+
+    # Create a 4x4 matrix (2 qubits)
+    data = backend.identity(4, dtype=backend.complex64)
+    tensor = Tensor(data)
+
+    # Call _operator_to_tensor with the mock Tensor
+    result = QuantumChannel._operator_to_tensor(tensor, partition=[2, 2])
+    assert result is not None
+
+
+def test_tensorflow_backend_order(monkeypatch):
+    """TensorFlow backends default to the ``euclidean`` norm order.
+
+    ``is_hermitian``, ``is_causal`` and ``is_unital`` resolve ``order=None``
+    to ``"euclidean"`` when the backend is a ``TensorflowBackend``, because
+    TensorFlow's norm functions do not support all order options. The norm
+    functions are mocked so the test only verifies the resolved ``order``.
+    """
+    backend = construct_backend("numpy")
+    channel = QuantumChannel(np.eye(4, dtype=complex), backend=backend)
+    comb = QuantumComb(np.eye(4, dtype=complex), backend=backend)
+
+    matrix_norm = MagicMock(return_value=0.0)
+    vector_norm = MagicMock(return_value=0.0)
+    # Make the backend report its class name as ``TensorflowBackend`` so the
+    # class-name check in the source triggers the euclidean default.
+    monkeypatch.setattr(
+        backend, "__class__", type("TensorflowBackend", (backend.__class__,), {})
+    )
+    monkeypatch.setattr(backend, "matrix_norm", matrix_norm)
+    monkeypatch.setattr(backend, "vector_norm", vector_norm)
+
+    assert channel.is_hermitian()
+    assert matrix_norm.call_args.args[1] == "euclidean"
+
+    assert comb.is_causal()
+    assert vector_norm.call_args.kwargs["order"] == "euclidean"
+
+    assert channel.is_unital()
+    assert vector_norm.call_args.kwargs["order"] == "euclidean"
+
+
+def test_pure_network_is_not_modified_by_conversions(backend):
+    unitary = random_unitary(2, seed=1, backend=backend)
+    network = QuantumNetwork(unitary, partition=(2, 2), pure=True, backend=backend)
+    shape = tuple(network._tensor.shape)
+
+    network.matrix()
+    network.operator(full=True)
+    network.full()
+
+    assert network.is_pure()
+    assert tuple(network._tensor.shape) == shape
+
+
+def test_quantum_network_constructors_default_arguments(backend):
+    with pytest.raises(TypeError):
+        QuantumNetwork(backend.cast(np.eye(4)), backend=backend)
+
+    # the default backend is the global one
+    identity = IdentityChannel(2)
+    assert identity.partition == (2, 2)
+    assert TraceOperation(2).partition == (2,)
+
+
+@pytest.mark.parametrize("number", [2.0, -2.0, 0.5, -0.5])
+def test_truediv_pure_network(backend, number):
+    unitary = random_unitary(2, seed=1, backend=backend)
+    network = QuantumNetwork(unitary, partition=(2, 2), pure=True, backend=backend)
+
+    divided = network / number
+
+    backend.assert_allclose(divided.full(), network.full() / number, atol=1e-10)
+    # only a positive number can be absorbed in the pure representation
+    assert divided.is_pure() is (number > 0)
+
+
+@pytest.mark.parametrize("pure", [False, True])
+@pytest.mark.parametrize("kind", ["unitary", "amplitude-damping"])
+def test_apply_matches_kraus_action(backend, kind, pure):
+    if kind == "unitary":
+        kraus = [backend.to_numpy(random_unitary(2, seed=1, backend=backend))]
+    else:
+        gamma = 0.3
+        kraus = [
+            np.array([[1, 0], [0, np.sqrt(1 - gamma)]], dtype=complex),
+            np.array([[0, np.sqrt(gamma)], [0, 0]], dtype=complex),
+        ]
+    if pure and len(kraus) > 1:
+        pytest.skip("only a single Kraus operator has a pure representation")
+
+    state = random_density_matrix(2, seed=5, backend=backend)
+    target = sum(k @ backend.to_numpy(state) @ k.conj().T for k in kraus)
+
+    if pure:
+        operator = backend.cast(kraus[0])
+    else:
+        operator = backend.cast(
+            sum(np.outer(k.reshape(-1), k.reshape(-1).conj()) for k in kraus)
+        )
+    network = QuantumChannel.from_operator(
+        operator, (2, 2), pure=pure, backend=backend, inverse=True
+    )
+
+    np.testing.assert_allclose(
+        backend.to_numpy(network.apply(state)), target, atol=1e-10
+    )

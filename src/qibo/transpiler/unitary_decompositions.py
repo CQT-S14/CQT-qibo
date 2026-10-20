@@ -1,13 +1,20 @@
+import cmath
+import functools
 import math
 
 import numpy as np
 from numpy.typing import ArrayLike
 
 from qibo import gates, matrices
-from qibo.backends import Backend, _check_backend
+from qibo.backends import Backend, _check_backend, _numpy_backend
 from qibo.config import raise_error
 from qibo.gates.abstract import Gate
-from qibo.quantum_info.linalg_operations import schmidt_decomposition
+from qibo.quantum_info.linalg_operations import (
+    cosine_sin_decomposition,
+    schmidt_decomposition,
+    schur_decomposition,
+)
+from qibo.transpiler._exceptions import DecompositionError
 
 magic_basis = np.array(
     [[1, -1j, 0, 0], [0, 0, 1, -1j], [0, 0, -1, -1j], [1, 1j, 0, 0]]
@@ -18,6 +25,45 @@ bell_basis = np.array(
 ) / np.sqrt(2)
 
 
+# Euler bases of :func:`qibo.transpiler.unitary_decompositions.single_qubit_decomposition`
+# and :class:`qibo.transpiler.optimizer.Optimize1qGatesDecomposition`. Each name maps
+# to the names of the gates that the basis needs.
+_EULER_BASES = {
+    "U3": ("u3",),
+    "U321": ("u1", "u2", "u3"),
+    "ZYZ": ("rz", "ry"),
+    "ZXZ": ("rz", "rx"),
+    "XZX": ("rx", "rz"),
+    "XYX": ("rx", "ry"),
+    "ZSX": ("rz", "sx"),
+    "ZSXX": ("rz", "sx", "x"),
+}
+
+# Single-qubit gates without parameters and the angle of the rotations of the gates
+# with an angle. Each rotation is given by its axis and by the extra arguments of the gate.
+_FIXED_GATES = (
+    gates.H,
+    gates.S,
+    gates.SDG,
+    gates.SX,
+    gates.SXDG,
+    gates.T,
+    gates.TDG,
+    gates.X,
+    gates.Y,
+    gates.Z,
+)
+_ROTATIONS = {
+    gates.RX: (((1.0, 0.0, 0.0), ()),),
+    gates.RY: (((0.0, 1.0, 0.0), ()),),
+    gates.RZ: (((0.0, 0.0, 1.0), ()),),
+    gates.PRX: (
+        ((1.0, 0.0, 0.0), (0.0,)),
+        ((0.0, 1.0, 0.0), (math.pi / 2,)),
+    ),
+}
+
+
 def u3_decomposition(
     unitary: ArrayLike, backend: Backend
 ) -> tuple[float, float, float]:
@@ -25,6 +71,8 @@ def u3_decomposition(
 
     Args:
         unitary (ArrayLike): Unitary :math:`2 \\times 2` matrix to be decomposed.
+        backend (:class:`qibo.backends.abstract.Backend`): Backend to be used in the
+            calculation.
 
     Returns:
         Tuple[float, float, float]: Parameters of :class:`qibo.gates.gates.U3` gate.
@@ -42,7 +90,10 @@ def u3_decomposition(
 
 
 def calculate_psi(
-    unitary: ArrayLike, backend: Backend, magic_basis: ArrayLike = magic_basis
+    unitary: ArrayLike,
+    magic_basis: ArrayLike = magic_basis,
+    weight: float = math.sqrt(2),
+    backend: Backend | None = None,
 ) -> tuple[ArrayLike, ArrayLike]:
     """Solves the eigenvalue problem of :math:`U^{T} U`.
 
@@ -53,19 +104,33 @@ def calculate_psi(
             in the computational basis.
         magic_basis (ArrayLike, optional): basis in which to solve the eigenvalue problem.
             Defaults to ``magic basis``.
-        backend (:class:`qibo.backends.abstract.Backend`): Backend to use for calculations.
+        weight (float, optional): The matrix :math:`M = U^{T} U` written in the magic basis
+            is symmetric and unitary, so its real and imaginary parts have the same
+            eigenvectors. They are found by diagonalizing the real matrix
+            :math:`\\text{Re}(M) + w \\, \\text{Im}(M)`, where :math:`w` is ``weight``.
+            Two different eigenvalues :math:`e^{i \\varphi_{1}}` and
+            :math:`e^{i \\varphi_{2}}` of :math:`M` become equal in this matrix if
+            :math:`\\tan((\\varphi_{1} + \\varphi_{2}) / 2) = w`, and the eigenvectors are
+            then not reliable. The default avoids this for angles that are multiples
+            of :math:`\\pi / 4`, which are common in circuits made of Clifford and
+            :math:`T` gates. Defaults to :math:`\\sqrt{2}`.
+        backend (:class:`qibo.backends.abstract.Backend`, optional): backend to be used
+            in the execution. If ``None``, it uses the current backend.
+            Defaults to ``None``.
 
     Returns:
         Tuple[ArrayLike, ArrayLike]: Eigenvectors in the computational basis
         and eigenvalues of :math:`U^{T} U`.
     """
+    backend = _check_backend(backend)
+
     magic_basis = backend.cast(magic_basis)
     unitary = backend.cast(unitary)
     # write unitary in magic basis
     u_magic = backend.conj(magic_basis).T @ unitary @ magic_basis
     # construct and diagonalize UT_U
     ut_u = u_magic.T @ u_magic
-    ut_u_real = backend.real(ut_u) + backend.imag(ut_u)
+    ut_u_real = backend.real(ut_u) + weight * backend.imag(ut_u)
     if backend.__class__.__name__ not in ("PyTorchBackend", "TensorflowBackend"):
         ut_u_real = backend.round(ut_u_real, decimals=15)
 
@@ -82,12 +147,15 @@ def calculate_psi(
 def calculate_single_qubit_unitaries(
     psi: ArrayLike, backend: Backend | None = None
 ) -> tuple[ArrayLike, ArrayLike]:
-    """Calculates local unitaries that maps a maximally entangled basis to the magic basis.
+    """Calculates local unitaries that map a maximally entangled basis to the magic basis.
 
     See Lemma 1 of Appendix A in Ref. [1].
 
     Args:
         psi (ArrayLike): Maximally entangled two-qubit states that define a basis.
+        backend (:class:`qibo.backends.abstract.Backend`, optional): Backend to be used
+            in the calculation. If ``None``, it uses the current backend.
+            Defaults to ``None``.
 
     Returns:
         Tuple[ArrayLike, ArrayLike]: Local unitaries UA and UB that map the given
@@ -95,9 +163,11 @@ def calculate_single_qubit_unitaries(
 
     References:
         1. B. Kraus and J. I. Cirac, *Optimal creation of entanglement using a two-qubit gate*,
-        `Phys. Rev. A 63, 062309 (2001) <https://doi.org/10.1103/PhysRevA.63.062309 >`_.
+        `Phys. Rev. A 63, 062309 (2001) <https://doi.org/10.1103/PhysRevA.63.062309>`_.
 
     """
+    backend = _check_backend(backend)
+
     psi_magic = backend.matmul(backend.conj(backend.cast(magic_basis)).T, psi)
     if (
         backend.real(backend.matrix_norm(backend.imag(psi_magic))) > 1e-6
@@ -253,16 +323,21 @@ def calculate_diagonal(
 
 
 def magic_decomposition(
-    unitary: ArrayLike, backend: Backend | None = None
+    unitary: ArrayLike,
+    backend: Backend | None = None,
+    weight: float = math.sqrt(2),
 ) -> tuple[ArrayLike, ...]:
-    """Decomposes an arbitrary unitary to (A1) from arXiv:quant-ph/0011050."""
+    """Decomposes an arbitrary unitary to (A1) from arXiv:quant-ph/0011050.
+
+    The argument ``weight`` is defined in :func:`qibo.transpiler.unitary_decompositions.calculate_psi`.
+    """
     backend = _check_backend(backend)
     unitary = backend.cast(unitary, dtype=unitary.dtype)
-    psi, eigvals = calculate_psi(unitary, backend=backend)
+    psi, eigvals = calculate_psi(unitary, backend=backend, weight=weight)
     psi_tilde = backend.conj(backend.sqrt(eigvals)) * backend.matmul(unitary, psi)
     va, vb = calculate_single_qubit_unitaries(psi, backend=backend)
     ua_dagger, ub_dagger = calculate_single_qubit_unitaries(psi_tilde, backend=backend)
-    dag = lambda U: backend.transpose(backend.conj(U), (1, 0))
+    dag = lambda U: backend.dagger(U)
     ua, ub = dag(ua_dagger), dag(ub_dagger)
     return calculate_diagonal(unitary, ua, ub, va, vb, backend=backend)
 
@@ -354,48 +429,575 @@ def cnot_decomposition_light(
     ]
 
 
+def quantum_shannon_decomposition(
+    qubits: tuple[int, ...], unitary: ArrayLike, backend: Backend | None = None
+) -> list[Gate]:
+    """Quantum Shannon decomposition of a unitary matrix acting on several qubits.
+
+    The cosine-sine decomposition of an :math:`n`-qubit unitary :math:`U`, whose blocks
+    are defined by the first qubit, is
+
+    .. math::
+        U = (A_{1} \\oplus A_{2}) \\, \begin{pmatrix} C & -S \\ S & C \\end{pmatrix} \\,
+        (B_{1} \\oplus B_{2}) \\, ,
+
+    where the middle matrix is a multiplexed :class:`qibo.gates.gates.RY` rotation of
+    the first qubit, controlled by the other :math:`n - 1` qubits. Each block-diagonal
+    matrix is decomposed as
+
+    .. math::
+        X_{1} \\oplus X_{2} = (\\mathbb{I} \\otimes V) \\, (D \\oplus D^{\\dagger}) \\,
+        (\\mathbb{I} \\otimes W) \\, ,
+
+    with :math:`V D^{2} V^{\\dagger} = X_{1} X_{2}^{\\dagger}` and
+    :math:`W = D V^{\\dagger} X_{2}`, where :math:`D \\oplus D^{\\dagger}` is a
+    multiplexed :class:`qibo.gates.gates.RZ` rotation of the first qubit. The result
+    has four unitaries on the last :math:`n - 1` qubits and three multiplexed
+    rotations, *i.e.* :class:`qibo.gates.gates.Multiplexor` gates. Decomposing the
+    unitaries in the same way until they act on two qubits uses
+    :math:`(9 / 16) \\, 4^{n} - (3 / 2) \\, 2^{n}` two-qubit gates, if the unitaries
+    on two qubits are decomposed with three of them. It does not use auxiliary qubits.
+
+    Args:
+        qubits (tuple[int, ...]): Ids of the qubits that ``unitary`` acts on, with at
+            least two. The first one is the most significant bit of the indices of
+            ``unitary``.
+        unitary (ArrayLike): Unitary matrix of shape :math:`(2^{n}, 2^{n})`, with
+            :math:`n` the number of ``qubits``.
+        backend (:class:`qibo.backends.abstract.Backend`, optional): Backend to use
+            for the matrices. If ``None``, defaults to the global backend.
+            Defaults to ``None``.
+
+    Returns:
+        list[:class:`qibo.gates.abstract.Gate`]: Gates, in order of application, that
+        implement ``unitary``: four :class:`qibo.gates.gates.Unitary` gates on
+        ``qubits[1:]`` and three :class:`qibo.gates.gates.Multiplexor` gates. Each
+        of them acts on less qubits than ``unitary``, so they can be decomposed in turn.
+
+    Raises:
+        ValueError: If there are less than two ``qubits``, or ``unitary`` does not have
+            the shape :math:`(2^{n}, 2^{n})`.
+
+    References:
+        1. V. V. Shende, S. S. Bullock, and I. L. Markov,
+        *Synthesis of quantum-logic circuits*,
+        `IEEE Trans. Comput.-Aided Des. Integr. Circuits Syst. 25, 1000 (2006)
+        <https://doi.org/10.1109/TCAD.2005.855930>`_.
+    """
+    backend = _check_backend(backend)
+
+    if len(qubits) < 2 or unitary.shape != (2 ** len(qubits),) * 2:
+        raise_error(
+            ValueError,
+            f"``unitary`` must have shape {(2 ** len(qubits),) * 2} for {len(qubits)} "
+            + f"qubits, and there must be at least two, got shape {unitary.shape}.",
+        )
+
+    half = len(unitary) // 2
+    left, middle, right = cosine_sin_decomposition(unitary, backend=backend)
+    angles = 2 * backend.arctan2(
+        backend.real(backend.diag(middle[half:, :half])),
+        backend.real(backend.diag(middle[:half, :half])),
+    )
+    return [
+        *_block_diagonal_decomposition(
+            qubits, right[:half, :half], right[half:, half:], backend=backend
+        ),
+        gates.Multiplexor(qubits[1:], qubits[0], angles, axis="y"),
+        *_block_diagonal_decomposition(
+            qubits, left[:half, :half], left[half:, half:], backend=backend
+        ),
+    ]
+
+
+def single_qubit_decomposition(
+    unitary: ArrayLike,
+    qubit: int,
+    gate_classes: tuple[type[Gate], ...],
+    atol: float = 1e-12,
+    backend: Backend | None = None,
+) -> list[Gate]:
+    """Decomposes a single-qubit unitary into the given single-qubit gates.
+
+    If the gates contain an Euler basis of
+    :class:`qibo.transpiler.optimizer.Optimize1qGatesDecomposition`, such as
+    :class:`qibo.gates.RZ` and :class:`qibo.gates.SX`, the shortest decomposition in the
+    Euler bases is returned. Otherwise, two rotations with free angles about orthogonal
+    axes, :math:`R_{a}(\\alpha) R_{b}(\\beta) R_{a}(\\gamma)`, are used, where
+    :math:`R_{n}(\\varphi)` is the rotation by the angle :math:`\\varphi` about the axis
+    :math:`n`. The rotations are those of :class:`qibo.gates.RX`,
+    :class:`qibo.gates.RY`, :class:`qibo.gates.RZ` and :class:`qibo.gates.PRX`, and
+    their axes can be rotated by the gates without parameters among
+    :class:`qibo.gates.H`, :class:`qibo.gates.S`, :class:`qibo.gates.SDG`,
+    :class:`qibo.gates.SX`, :class:`qibo.gates.SXDG`, :class:`qibo.gates.T`,
+    :class:`qibo.gates.TDG`, :class:`qibo.gates.X`, :class:`qibo.gates.Y` and
+    :class:`qibo.gates.Z`, which are conjugated with the rotation. The decomposition
+    is equal to the unitary up to a global phase.
+
+    Args:
+        unitary (ArrayLike): Unitary :math:`2 \\times 2` matrix to be decomposed.
+        qubit (int): Qubit the gates act on.
+        gate_classes (tuple[type[:class:`qibo.gates.abstract.Gate`], ...]): Single-qubit
+            gates that can be used.
+        atol (float, optional): Tolerance to decide that an angle is zero.
+            Defaults to :math:`10^{-12}`.
+        backend (:class:`qibo.backends.abstract.Backend`, optional): Backend to use
+            for calculations. If ``None``, defaults to the global backend.
+            Defaults to ``None``.
+
+    Returns:
+        list[:class:`qibo.gates.abstract.Gate`]: Gates that implement the unitary.
+
+    Raises:
+        DecompositionError: If the gates have no Euler basis and no two rotations about
+            orthogonal axes.
+    """
+    backend = _check_backend(backend)
+    unitary = backend.cast(unitary)
+
+    names = {gate_class.__name__.lower() for gate_class in gate_classes}
+    bases = [name for name, gates_ in _EULER_BASES.items() if set(gates_) <= names]
+    if bases:
+        hadamard = gates.H(0).matrix(backend)
+        angles = u3_decomposition(unitary, backend)
+        angles_x = u3_decomposition(hadamard @ unitary @ hadamard, backend)
+        return min(
+            (
+                _euler_sequence(name, qubit, angles, angles_x, atol, backend)
+                for name in bases
+            ),
+            key=len,
+        )
+
+    frames = _euler_frames(tuple(gate_classes))
+    if frames is None:
+        raise_error(
+            DecompositionError,
+            "The single-qubit native gates must include rotations about two orthogonal "
+            + "axes with free angles, which can be rotated by native gates without "
+            + "parameters. U3 and GPI2 can be used as well.",
+        )
+
+    frame = backend.cast(frames[0], dtype=unitary.dtype)
+    theta, phi, lam = u3_decomposition(backend.conj(frame).T @ unitary @ frame, backend)
+
+    # If the middle rotation is the identity, the two outer rotations are merged.
+    if abs(math.remainder(theta, 2 * math.pi)) < atol:
+        rotations = [(lam + phi, frames[1])]
+    else:
+        rotations = [(lam, frames[1]), (theta, frames[2]), (phi, frames[1])]
+
+    decomposition = []
+    for angle, (gate_class, extra, word, inverse_word) in rotations:
+        if abs(math.remainder(angle, 2 * math.pi)) > atol:
+            decomposition.extend(gate(qubit) for gate in inverse_word)
+            decomposition.append(gate_class(qubit, angle, *extra))
+            decomposition.extend(gate(qubit) for gate in word)
+
+    return decomposition
+
+
 def two_qubit_decomposition(
-    q0: int, q1: int, unitary: ArrayLike, backend: Backend, threshold: float = 1e-6
+    q0: int,
+    q1: int,
+    unitary: ArrayLike,
+    threshold: float = 1e-6,
+    weight: float = math.sqrt(2),
+    backend: Backend | None = None,
 ) -> list[Gate]:
     """Performs two qubit unitary gate decomposition.
+
+    The decomposition has at most three :class:`qibo.gates.CZ` gates [1]. It has two or
+    fewer if the unitary needs fewer, which is decided from the operator-Schmidt
+    coefficients of the unitary [2]: a product of two single-qubit unitaries uses no
+    :class:`qibo.gates.CZ` gate, and a unitary that is locally equivalent to
+    :class:`qibo.gates.CZ` uses one.
 
     Args:
         q0 (int): index of the first qubit.
         q1 (int): index of the second qubit.
         unitary (ndarray): Unitary :math:`4 \\times 4` to be decomposed.
-        backend (:class:`qibo.backends.Backend`): Backend to use for calculations.
-        threshold (float): Threshold for determining if hz component is zero.
+        threshold (float): Threshold for determining if hz component is zero, and
+            if the operator-Schmidt coefficients of the unitary vanish or coincide.
+        weight (float, optional): Weight of the imaginary part in the matrix that is
+            diagonalized to find the local gates, see
+            :func:`qibo.transpiler.unitary_decompositions.calculate_psi`.
+            Defaults to :math:`\\sqrt{2}`.
+        backend (:class:`qibo.backends.abstract.Backend`, optional): backend to be used
+            in the execution. If ``None``, it uses the current backend.
+            Defaults to ``None``.
 
     Returns:
         list: gates implementing the decomposition
+
+    References:
+        1. F. Vatan and C. Williams,
+        *Optimal quantum circuits for general two-qubit gates*,
+        `Phys. Rev. A 69, 032315 (2004) <https://doi.org/10.1103/PhysRevA.69.032315>`_.
+
+        2. V. V. Shende, I. L. Markov and S. S. Bullock,
+        *Minimal universal two-qubit controlled-NOT-based circuits*,
+        `Phys. Rev. A 69, 062321 (2004) <https://doi.org/10.1103/PhysRevA.69.062321>`_.
     """
+    backend = _check_backend(backend)
+
     # Handle identity case efficiently
     if backend.allclose(unitary, backend.identity(4)):
         return []
 
-    z_component = _get_z_component(unitary, backend)
-    if abs(z_component) < threshold:
-        return _two_qubit_decomposition_without_z(q0, q1, unitary, backend)
-    return _two_qubit_decomposition_with_z(q0, q1, unitary, backend)
+    # The singular values of the realigned unitary, i.e. its operator-Schmidt coefficients,
+    # do not change under single-qubit gates. They are (2, 0, 0, 0) for a product of
+    # single-qubit gates, which needs no CZ gate, and (sqrt(2), sqrt(2), 0, 0) for a gate
+    # locally equivalent to CZ, which needs one.
+    matrix = backend.to_numpy(unitary)
+    left, singular, right = np.linalg.svd(
+        matrix.reshape(2, 2, 2, 2).transpose(0, 2, 1, 3).reshape(4, 4)
+    )
+    if singular[1] < threshold:
+        factor = math.sqrt(singular[0])
+        return [
+            gates.Unitary(
+                backend.cast(factor * left[:, 0].reshape(2, 2), dtype=matrix.dtype), q0
+            ),
+            gates.Unitary(
+                backend.cast(factor * right[0].reshape(2, 2), dtype=matrix.dtype), q1
+            ),
+        ]
+    if singular[2] < threshold and singular[0] - singular[1] < threshold:
+        # The interaction part of the unitary is then a product of Pauli rotations by
+        # multiples of pi / 2, which are local, and one rotation by an odd multiple of
+        # pi / 4 about an axis P. The latter is exp(i pi / 4 PP) = exp(i pi / 4) (K x K)
+        # CZ (S^dagger K^dagger x S^dagger K^dagger), with K Z K^dagger = P.
+        u4, v4, ud, u1, v1 = (
+            backend.to_numpy(array)
+            for array in magic_decomposition(unitary, backend=backend, weight=weight)
+        )
+        hadamard = np.array([[1, 1], [1, -1]]) / math.sqrt(2)
+        phase = np.diag([1, 1j])
+        for pauli, frame in (
+            (matrices.Z, np.eye(2)),
+            (matrices.X, hadamard),
+            (matrices.Y, phase @ hadamard),
+        ):
+            entangler = (np.eye(4) + 1j * np.kron(pauli, pauli)) / math.sqrt(2)
+            first, coefficients, second = np.linalg.svd(
+                (ud @ entangler.conj().T)
+                .reshape(2, 2, 2, 2)
+                .transpose(0, 2, 1, 3)
+                .reshape(4, 4)
+            )
+            if coefficients[1] < threshold:
+                factor = math.sqrt(coefficients[0])
+                before = phase.conj() @ frame.conj().T
+                after = cmath.exp(1j * math.pi / 4) * frame
+                return [
+                    gates.Unitary(backend.cast(before @ u1, dtype=matrix.dtype), q0),
+                    gates.Unitary(backend.cast(before @ v1, dtype=matrix.dtype), q1),
+                    gates.CZ(q0, q1),
+                    gates.Unitary(
+                        backend.cast(
+                            u4 @ (factor * first[:, 0].reshape(2, 2)) @ after,
+                            dtype=matrix.dtype,
+                        ),
+                        q0,
+                    ),
+                    gates.Unitary(
+                        backend.cast(
+                            v4 @ (factor * second[0].reshape(2, 2)) @ frame,
+                            dtype=matrix.dtype,
+                        ),
+                        q1,
+                    ),
+                ]
+
+    # ``hz`` is defined up to multiples of pi, which only change the global phase of the
+    # unitary. Its representative depends on the choice of the degenerate eigenvectors
+    # in the magic decomposition, e.g. for iSWAP, hence it is compared modulo pi.
+    z_component = _get_z_component(unitary, weight, backend)
+    if abs(math.remainder(z_component, math.pi)) < threshold:
+        return _two_qubit_decomposition_without_z(q0, q1, unitary, weight, backend)
+    return _two_qubit_decomposition_with_z(q0, q1, unitary, weight, backend)
 
 
-def _get_z_component(unitary: ArrayLike, backend: Backend) -> float:
+def _block_diagonal_decomposition(
+    qubits: tuple[int, ...],
+    first_block: ArrayLike,
+    second_block: ArrayLike,
+    backend: Backend | None = None,
+) -> list[Gate]:
+    """Decompose a block-diagonal unitary, see :func:`quantum_shannon_decomposition`.
+
+    Args:
+        qubits (tuple[int, ...]): Qubits that the block-diagonal unitary acts on, where
+            the first one selects the block.
+        first_block (ArrayLike): Block for the first qubit in the state :math:`\\ket{0}`.
+        second_block (ArrayLike): Block for the first qubit in the state :math:`\\ket{1}`.
+        backend (:class:`qibo.backends.abstract.Backend`, optional): Backend to use for the
+            matrices.
+
+    Returns:
+        list[:class:`qibo.gates.abstract.Gate`]: A unitary and a multiplexed
+        :class:`qibo.gates.gates.RZ` rotation, followed by a unitary, in order of
+        application.
+    """
+    backend = _check_backend(backend)
+
+    schur_form, eigenvectors = schur_decomposition(
+        first_block @ backend.dagger(second_block), backend=backend
+    )
+    eigenphases = backend.angle(backend.diag(schur_form))
+    second_unitary = backend.exp(0.5j * eigenphases)[:, None] * (
+        backend.dagger(eigenvectors) @ second_block
+    )
+    return [
+        gates.Unitary(second_unitary, *qubits[1:]),
+        gates.Multiplexor(qubits[1:], qubits[0], -eigenphases, axis="z"),
+        gates.Unitary(eigenvectors, *qubits[1:]),
+    ]
+
+
+@functools.cache
+def _euler_frames(gate_classes: tuple[type[Gate], ...]) -> tuple | None:
+    """Finds two rotations about orthogonal axes for :func:`single_qubit_decomposition`.
+
+    Rotations of the given gates are also considered when their axes are rotated by a
+    sequence of the gates without parameters, :math:`G R_{n}(\\varphi) G^{\\dagger}`,
+    where :math:`G` is the unitary of the sequence. Sequences with at most four gates
+    are used. The rotations with the lowest total number of gates are chosen.
+
+    Args:
+        gate_classes (tuple[type[:class:`qibo.gates.abstract.Gate`], ...]): Single-qubit
+            gates that can be used.
+
+    Returns:
+        tuple | None: ``None`` if there are no such rotations. Otherwise, the unitary that
+        takes the axes to the :math:`z` and :math:`y` axes, followed by the rotation about
+        the first axis and about the second axis, each given by the gate class, its extra
+        arguments, and the gate classes of :math:`G` and of :math:`G^{\\dagger}`.
+    """
+    backend = _numpy_backend()
+    paulis = (matrices.X, matrices.Y, matrices.Z)
+
+    def to_rotation(unitary):
+        return np.array(
+            [
+                [np.trace(p @ unitary @ q @ unitary.conj().T).real / 2 for q in paulis]
+                for p in paulis
+            ]
+        )
+
+    free = [
+        (np.array(axis), gate_class, extra)
+        for gate_class in gate_classes
+        for axis, extra in _ROTATIONS.get(gate_class, ())
+    ]
+    # Rotations of the gates without parameters, and the number of times that each
+    # of them is applied to get the identity (up to a global phase).
+    fixed = {}
+    for gate_class in gate_classes:
+        if gate_class in _FIXED_GATES:
+            matrix = backend.to_numpy(gate_class(0).matrix(backend))
+            power = matrix
+            for order in range(1, 17):
+                if abs(np.trace(power)) > 2 - 1e-9:
+                    fixed[gate_class] = (to_rotation(matrix), order)
+                    break
+                power = power @ matrix
+
+    # Sequences of the gates without parameters, without repeated rotations.
+    elements = {(): np.eye(3)}
+    keys = {tuple(np.round(np.eye(3), 8).ravel() + 0.0)}
+    frontier = [()]
+    for _ in range(4):
+        new_frontier = []
+        for word in frontier:
+            for gate_class, (rotation, _) in fixed.items():
+                new_rotation = rotation @ elements[word]
+                key = tuple(np.round(new_rotation, 8).ravel() + 0.0)
+                if key not in keys:
+                    keys.add(key)
+                    elements[word + (gate_class,)] = new_rotation
+                    new_frontier.append(word + (gate_class,))
+        frontier = new_frontier
+
+    candidates = [
+        (
+            len(word) + sum(fixed[gate_class][1] - 1 for gate_class in word),
+            word,
+            rotation @ axis,
+            gate_class,
+            extra,
+        )
+        for word, rotation in elements.items()
+        for axis, gate_class, extra in free
+    ]
+    candidates.sort(key=lambda candidate: candidate[0])
+    best = None
+    for i, first in enumerate(candidates):
+        if best is not None and 3 * first[0] >= best[0]:
+            break
+        for second in candidates[i + 1 :]:
+            if abs(first[2] @ second[2]) < 1e-9:
+                # The first rotation is used twice, so it is the cheaper one.
+                total = 2 * first[0] + second[0]
+                if best is None or total < best[0]:
+                    best = (total, first, second)
+                break
+
+    if best is None:
+        return None
+
+    # The unitary of the rotation that takes the z axis to the first axis, and the
+    # y axis to the second axis, obtained from the quaternion of the rotation.
+    z_axis, y_axis = best[1][2], best[2][2]
+    rotation = np.column_stack([np.cross(y_axis, z_axis), y_axis, z_axis])
+    trace = np.trace(rotation)
+    if trace > 0:
+        scale = 2 * math.sqrt(trace + 1)
+        quaternion = np.array(
+            [
+                scale / 4,
+                (rotation[2, 1] - rotation[1, 2]) / scale,
+                (rotation[0, 2] - rotation[2, 0]) / scale,
+                (rotation[1, 0] - rotation[0, 1]) / scale,
+            ]
+        )
+    else:
+        i = int(np.argmax(np.diag(rotation)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        scale = 2 * math.sqrt(1 + rotation[i, i] - rotation[j, j] - rotation[k, k])
+        quaternion = np.zeros(4)
+        quaternion[0] = (rotation[k, j] - rotation[j, k]) / scale
+        quaternion[1 + i] = scale / 4
+        quaternion[1 + j] = (rotation[j, i] + rotation[i, j]) / scale
+        quaternion[1 + k] = (rotation[k, i] + rotation[i, k]) / scale
+    frame = quaternion[0] * np.eye(2) - 1j * sum(
+        component * pauli for component, pauli in zip(quaternion[1:], paulis)
+    )
+
+    axes = []
+    for _, word, _, gate_class, extra in best[1:]:
+        inverse_word = tuple(
+            inverse_gate
+            for gate in reversed(word)
+            for inverse_gate in (gate,) * (fixed[gate][1] - 1)
+        )
+        axes.append((gate_class, extra, word, inverse_word))
+
+    return (frame, *axes)
+
+
+def _euler_sequence(
+    name: str,
+    qubit: int,
+    angles: tuple[float, float, float],
+    angles_x: tuple[float, float, float],
+    atol: float,
+    backend: Backend,
+) -> list[Gate]:
+    """Gates of a unitary in the Euler basis ``name``, up to a global phase.
+
+    Args:
+        name (str): Name of the Euler basis, a key of ``_EULER_BASES``.
+        qubit (int): Qubit the gates act on.
+        angles (tuple[float, float, float]): Parameters of the :class:`qibo.gates.U3`
+            gate equal to the unitary, up to a global phase.
+        angles_x (tuple[float, float, float]): The same for the unitary conjugated with
+            :class:`qibo.gates.H`, which swaps the :math:`X` and :math:`Z` axes. It is
+            used by the bases that start with a rotation about the :math:`X` axis.
+        atol (float): Tolerance to decide that an angle is zero, or that
+            :math:`\\theta` is :math:`\\pi / 2` or :math:`\\pi`.
+        backend (:class:`qibo.backends.abstract.Backend`): Backend to use for calculations.
+
+    Returns:
+        list[:class:`qibo.gates.abstract.Gate`]: Gates of the basis. Rotations by a
+        multiple of :math:`2 \\pi` are left out.
+    """
+    theta, phi, lam = angles
+    theta_x, phi_x, lam_x = angles_x
+    # Each step is a gate class followed by its parameters.
+    if name == "U3":
+        identity_angles = backend.abs(theta) <= atol and (
+            abs(math.remainder(phi + lam, 2 * math.pi)) <= atol
+        )
+        steps = [] if identity_angles else [(gates.U3, theta, phi, lam)]
+    elif name == "U321" and backend.abs(theta) <= atol:
+        steps = [(gates.U1, phi + lam)]
+    elif name == "U321" and backend.abs(theta - math.pi / 2) <= atol:
+        steps = [(gates.U2, phi, lam)]
+    elif name == "U321":
+        steps = [(gates.U3, theta, phi, lam)]
+    elif name in ("ZYZ", "ZXZ") and backend.abs(theta) <= atol:
+        steps = [(gates.RZ, phi + lam)]
+    elif name in ("XYX", "XZX") and backend.abs(theta_x) <= atol:
+        steps = [(gates.RX, phi_x + lam_x)]
+    elif name == "ZYZ":
+        steps = [(gates.RZ, lam), (gates.RY, theta), (gates.RZ, phi)]
+    elif name == "ZXZ":
+        steps = [
+            (gates.RZ, lam - math.pi / 2),
+            (gates.RX, theta),
+            (gates.RZ, phi + math.pi / 2),
+        ]
+    elif name == "XYX":
+        steps = [
+            (gates.RX, lam_x),
+            (gates.RY, -theta_x),
+            (gates.RX, phi_x),
+        ]
+    elif name == "XZX":
+        steps = [
+            (gates.RX, lam_x - math.pi / 2),
+            (gates.RZ, theta_x),
+            (gates.RX, phi_x + math.pi / 2),
+        ]
+    elif backend.abs(theta) <= atol:
+        # ZSX and ZSXX bases, with theta equal to zero.
+        steps = [(gates.RZ, phi + lam)]
+    elif name == "ZSXX" and backend.abs(theta - math.pi) <= atol:
+        steps = [(gates.RZ, lam + math.pi), (gates.X,), (gates.RZ, phi)]
+    elif backend.abs(theta - math.pi / 2) <= atol:
+        steps = [
+            (gates.RZ, lam - math.pi / 2),
+            (gates.SX,),
+            (gates.RZ, phi + math.pi / 2),
+        ]
+    else:
+        steps = [
+            (gates.RZ, lam),
+            (gates.SX,),
+            (gates.RZ, theta + math.pi),
+            (gates.SX,),
+            (gates.RZ, phi + math.pi),
+        ]
+
+    # Rotations by a multiple of 2 pi are left out.
+    sequence = [
+        step[0](qubit, *step[1:])
+        for step in steps
+        if len(step) != 2 or abs(math.remainder(step[1], 2 * math.pi)) > atol
+    ]
+
+    return sequence
+
+
+def _get_z_component(unitary: ArrayLike, weight: float, backend: Backend) -> float:
     """Calculates the hz component from a unitary's magic decomposition."""
-    _, _, ud, _, _ = magic_decomposition(unitary, backend=backend)
+    _, _, ud, _, _ = magic_decomposition(unitary, backend=backend, weight=weight)
     ud_diag = to_bell_diagonal(ud, backend=backend)
     _, _, hz = calculate_h_vector(ud_diag, backend=backend)
     return float(hz)
 
 
 def _two_qubit_decomposition_without_z(
-    q0: int, q1: int, unitary: ArrayLike, backend: Backend
+    q0: int, q1: int, unitary: ArrayLike, weight: float, backend: Backend
 ) -> list[Gate]:
-    """Implements Theorem 2 decomposition (2 CNOTs) for hz=0 case."""
+    """Implements Theorem 2 decomposition (2 CNOTs) for hz=0 (modulo pi) case."""
     # Get magic decomposition
-    u4, v4, ud, u1, v1 = magic_decomposition(unitary, backend=backend)
+    u4, v4, ud, u1, v1 = magic_decomposition(unitary, backend=backend, weight=weight)
     ud_diag = to_bell_diagonal(ud, backend=backend)
-    hx, hy, _ = calculate_h_vector(ud_diag, backend=backend)
-    hx, hy = float(hx), float(hy)
+    hx, hy, hz = calculate_h_vector(ud_diag, backend=backend)
+    hx, hy, hz = float(hx), float(hy), float(hz)
 
     # Get light decomposition
     gatelist = cnot_decomposition_light(q0, q1, hx, hy, backend=backend)
@@ -405,18 +1007,20 @@ def _two_qubit_decomposition_without_z(
     gatelist[1] = gates.Unitary(backend.cast(g1.parameters[0]) @ v1, q1)
 
     g0, g1 = gatelist[-2:]
-    gatelist[-2] = gates.Unitary(u4 @ g0.parameters[0], q0)
+    # A shift of ``hz`` by pi multiplies the unitary by a global phase of -1.
+    phase = (-1) ** round(hz / math.pi)
+    gatelist[-2] = gates.Unitary(phase * u4 @ g0.parameters[0], q0)
     gatelist[-1] = gates.Unitary(v4 @ g1.parameters[0], q1)
 
     return gatelist
 
 
 def _two_qubit_decomposition_with_z(
-    q0: int, q1: int, unitary: ArrayLike, backend: Backend
+    q0: int, q1: int, unitary: ArrayLike, weight: float, backend: Backend
 ) -> list[Gate]:
     """Implements Theorem 1 decomposition (3 CNOTs) for hz≠0 case."""
     # Get magic decomposition
-    u4, v4, ud, u1, v1 = magic_decomposition(unitary, backend=backend)
+    u4, v4, ud, u1, v1 = magic_decomposition(unitary, backend=backend, weight=weight)
     ud_diag = to_bell_diagonal(ud, backend=backend)
     hx, hy, hz = calculate_h_vector(ud_diag, backend=backend)
     hx, hy, hz = float(hx), float(hy), float(hz)

@@ -1,18 +1,23 @@
 """Tests for the quantum_info.random_ensembles module."""
 
 from functools import reduce
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
 from qibo import Circuit, gates, matrices
 from qibo.config import PRECISION_TOL
+from qibo.models.encodings import entangling_layer
+from qibo.quantum_info.basis import pauli_to_comp_basis
 from qibo.quantum_info.metrics import purity
 from qibo.quantum_info.random_ensembles import (
     random_clifford,
     random_density_matrix,
     random_gaussian_matrix,
     random_hermitian,
+    random_iqp,
+    random_isometry,
     random_pauli,
     random_pauli_hamiltonian,
     random_quantum_channel,
@@ -97,43 +102,137 @@ def test_random_hermitian(backend):
     # test if function returns Hermitian operator
     dims = 4
     matrix = random_hermitian(dims, backend=backend)
-    matrix_dagger = backend.conj(matrix).T
+    matrix_dagger = backend.dagger(matrix)
     norm = float(backend.matrix_norm(matrix - matrix_dagger, order=2))
     backend.assert_allclose(norm < PRECISION_TOL, True)
 
     # test if function returns semidefinite Hermitian operator
     dims = 4
     matrix = random_hermitian(dims, semidefinite=True, backend=backend)
-    matrix_dagger = backend.conj(matrix).T
+    matrix_dagger = backend.dagger(matrix)
     norm = float(backend.matrix_norm(matrix - matrix_dagger, order=2))
     backend.assert_allclose(norm < PRECISION_TOL, True)
 
-    eigenvalues = np.linalg.eigvalsh(backend.to_numpy(matrix))
-    eigenvalues = np.real(eigenvalues)
+    eigenvalues = backend.eigvalsh(matrix)
+    eigenvalues = backend.real(eigenvalues)
     backend.assert_allclose(all(eigenvalues >= 0), True)
 
     # test if function returns normalized Hermitian operator
     dims = 4
     matrix = random_hermitian(dims, normalize=True, backend=backend)
-    matrix_dagger = backend.conj(matrix).T
+    matrix_dagger = backend.dagger(matrix)
     norm = float(backend.matrix_norm(matrix - matrix_dagger, order=2))
     backend.assert_allclose(norm < PRECISION_TOL, True)
 
-    eigenvalues = np.linalg.eigvalsh(backend.to_numpy(matrix))
-    eigenvalues = np.real(eigenvalues)
+    eigenvalues = backend.eigvalsh(matrix)
+    eigenvalues = backend.real(eigenvalues)
     backend.assert_allclose(all(eigenvalues <= 1), True)
 
     # test if function returns normalized and semidefinite Hermitian operator
     dims = 4
     matrix = random_hermitian(dims, semidefinite=True, normalize=True, backend=backend)
-    matrix_dagger = backend.conj(matrix).T
+    matrix_dagger = backend.dagger(matrix)
     norm = float(backend.vector_norm(matrix - matrix_dagger, order=2))
     backend.assert_allclose(norm < PRECISION_TOL, True)
 
-    eigenvalues = np.linalg.eigvalsh(backend.to_numpy(matrix))
-    eigenvalues = np.real(eigenvalues)
+    eigenvalues = backend.eigvalsh(matrix)
+    eigenvalues = backend.real(eigenvalues)
     backend.assert_allclose(all(eigenvalues >= 0), True)
     backend.assert_allclose(all(eigenvalues <= 1), True)
+
+
+def test_random_isometry_errors(backend):
+    with pytest.raises(TypeError):
+        random_isometry("4", backend=backend)
+    with pytest.raises(TypeError):
+        random_isometry(4, rank=2.0, backend=backend)
+    with pytest.raises(ValueError):
+        random_isometry(0, backend=backend)
+    with pytest.raises(ValueError):
+        random_isometry(4, rank=0, backend=backend)
+    with pytest.raises(ValueError):
+        random_isometry(2, rank=3, backend=backend)
+
+
+@pytest.mark.parametrize("seed", [None, 10])
+@pytest.mark.parametrize("dims,rank", [(4, None), (4, 4), (8, 3), (5, 1)])
+def test_random_isometry(backend, dims, rank, seed):
+    matrix = random_isometry(dims, rank, seed=seed, backend=backend)
+
+    rank = dims if rank is None else rank
+    assert tuple(matrix.shape) == (dims, rank)
+
+    # columns must be orthonormal, i.e. V^dagger V = identity
+    gram = backend.conj(matrix).T @ matrix
+    backend.assert_allclose(gram, backend.identity(rank), atol=PRECISION_TOL)
+
+    # if rank == dims, then V must be a unitary matrix
+    if rank == dims:
+        projector = matrix @ backend.conj(matrix).T
+        backend.assert_allclose(projector, backend.identity(dims), atol=PRECISION_TOL)
+
+
+def test_random_isometry_seed(backend):
+    matrix_1 = random_isometry(6, 2, seed=7, backend=backend)
+    matrix_2 = random_isometry(6, 2, seed=7, backend=backend)
+    matrix_3 = random_isometry(6, 2, seed=8, backend=backend)
+
+    backend.assert_allclose(matrix_1, matrix_2)
+    assert float(backend.matrix_norm(matrix_1 - matrix_3)) > PRECISION_TOL
+
+
+def test_random_isometry_haar_moments(backend):
+    dims, rank, nsamples = 4, 2, 1000
+
+    samples = backend.cast(
+        [
+            random_isometry(dims, rank, seed=seed, backend=backend)
+            for seed in range(nsamples)
+        ]
+    )
+
+    # V V^dagger is the projector onto a random ``rank``-dimensional subspace, and
+    # its average over the Haar measure is (rank / dims) times the identity
+    projectors = backend.einsum("sij,skj->sik", samples, samples.conj())
+    np.testing.assert_allclose(
+        backend.mean(projectors, axis=0),
+        (rank / dims) * backend.identity(dims),
+        atol=5e-2,
+    )
+
+    # marginal distribution of each entry is the same as for Haar unitaries:
+    # |V_ij|^2 ~ Beta(1, dims - 1), whose second moment is 2 / (dims * (dims + 1))
+    moment = backend.mean(backend.abs(samples) ** 4)
+    backend.assert_allclose(moment, 2 / (dims * (dims + 1)), atol=2e-2)
+
+
+@pytest.mark.parametrize("seed", [None, 10])
+@pytest.mark.parametrize("closed_boundary", [False, True])
+@pytest.mark.parametrize(
+    "architecture", ["all-to-all", "diagonal", "even_layer", "pyramid"]
+)
+def test_random_iqp(backend, architecture, closed_boundary, seed):
+    nqubits = 4
+
+    with pytest.raises(NotImplementedError):
+        random_iqp(nqubits, architecture="nonexistent", seed=seed, backend=backend)
+
+    circuit = random_iqp(
+        nqubits, architecture, closed_boundary, seed=seed, backend=backend
+    )
+
+    nentangling = len(
+        entangling_layer(nqubits, architecture, "RZZ", closed_boundary).queue
+    )
+
+    assert len(circuit.get_parameters()) == nqubits + nentangling
+    assert len(circuit.queue) == 3 * nqubits + nentangling
+
+    # Hadamard gates only at the beginning and at the end of the circuit
+    names = [gate.__class__.__name__ for gate in circuit.queue]
+    assert names[:nqubits] == ["H"] * nqubits
+    assert names[-nqubits:] == ["H"] * nqubits
+    assert set(names[nqubits:-nqubits]) == {"RZ", "RZZ"}
 
 
 @pytest.mark.parametrize("measure", [None, "haar"])
@@ -173,7 +272,7 @@ def test_random_quantum_channel(backend, representation, measure, rank, order):
     with pytest.raises(ValueError):
         random_quantum_channel(4, representation="Choi", backend=backend)
     with pytest.raises(ValueError):
-        random_quantum_channel(4, measure="bcsz", order="system")
+        random_quantum_channel(4, measure="bcsz", order="system", backend=backend)
 
     # All subroutines are already tested elsewhere,
     # so here we only execute them once for coverage
@@ -232,10 +331,10 @@ def test_random_density_matrix(backend, dims, pure, metric, basis, normalize):
         )
         if basis is None and normalize is False:
             backend.assert_allclose(
-                np.real(np.trace(backend.to_numpy(state))) <= 1.0 + PRECISION_TOL, True
+                backend.real(backend.trace(state)) <= 1.0 + PRECISION_TOL, True
             )
             backend.assert_allclose(
-                np.real(np.trace(backend.to_numpy(state))) >= 1.0 - PRECISION_TOL, True
+                backend.real(backend.trace(state)) >= 1.0 - PRECISION_TOL, True
             )
             backend.assert_allclose(
                 purity(state, backend=backend) <= 1.0 + PRECISION_TOL, True
@@ -244,17 +343,61 @@ def test_random_density_matrix(backend, dims, pure, metric, basis, normalize):
                 backend.assert_allclose(
                     purity(state, backend=backend) >= 1.0 - PRECISION_TOL, True
                 )
-            norm = np.abs(
-                backend.to_numpy(norm_function(state - backend.conj(state).T, order=2))
-            )
+            norm = backend.abs(norm_function(state - backend.dagger(state), order=2))
             backend.assert_allclose(norm < PRECISION_TOL, True)
         else:
             normalization = 1.0 if normalize is False else 1.0 / np.sqrt(dims)
             backend.assert_allclose(state[0], normalization)
-            assert all(
-                np.abs(backend.to_numpy(exp_value)) <= normalization
-                for exp_value in state[1:]
+            backend.assert_allclose(
+                [backend.abs(exp_value) <= normalization for exp_value in state[1:]],
+                True,
             )
+
+
+@pytest.mark.parametrize("metric", ["ginibre", "bures"])
+@pytest.mark.parametrize("rank", [1, 2, 3, 4])
+def test_random_density_matrix_rank(backend, metric, rank):
+    dims = 4
+    state = random_density_matrix(
+        dims, rank=rank, metric=metric, seed=10, backend=backend
+    )
+
+    backend.assert_allclose(backend.trace(state), 1.0, atol=PRECISION_TOL)
+
+    eigenvalues = backend.eigvalsh(state)
+    assert backend.sum(eigenvalues > PRECISION_TOL) == rank
+    assert backend.all(eigenvalues > -PRECISION_TOL)
+
+
+def test_random_density_matrix_rank_errors(backend):
+    with pytest.raises(ValueError):
+        random_density_matrix(4, rank=0, metric="ginibre", backend=backend)
+    with pytest.raises(ValueError):
+        random_density_matrix(4, rank=2, backend=backend)
+
+    # rank equal to dims is allowed for the Hilbert-Schmidt metric
+    random_density_matrix(4, rank=4, metric="hilbert-schmidt", backend=backend)
+
+
+@pytest.mark.parametrize(
+    "metric,expected",
+    [("hilbert-schmidt", 4 / 5), ("ginibre", 4 / 5), ("bures", 7 / 8)],
+)
+def test_random_density_matrix_mean_purity(backend, metric, expected):
+    # average purity over qubit states: 2 * N / (N^2 + 1) for the Hilbert-Schmidt
+    # measure and (5 * N^2 + 1) / (2 * N * (N^2 + 2)) for the Bures measure, with N = 2
+    nsamples = 1000
+    purities = [
+        float(
+            purity(
+                random_density_matrix(2, metric=metric, seed=seed, backend=backend),
+                backend=backend,
+            )
+        )
+        for seed in range(nsamples)
+    ]
+
+    backend.assert_allclose(backend.mean(purities), expected, atol=2e-2)
 
 
 @pytest.mark.parametrize("nqubits,nsamples", zip((1, 2), (int(3e2), int(3e3))))
@@ -296,6 +439,9 @@ def test_random_pauli_errors(backend):
         random_pauli(q, depth, backend=backend)
     with pytest.raises(ValueError):
         q, depth, max_qubits = 4, 1, 3
+        random_pauli(q, depth, max_qubits=max_qubits, backend=backend)
+    with pytest.raises(ValueError):
+        q, depth, max_qubits = [0, 5], 1, 3
         random_pauli(q, depth, max_qubits=max_qubits, backend=backend)
     with pytest.raises(TypeError):
         q, depth = 2, 1
@@ -396,14 +542,10 @@ def test_random_pauli_hamiltonian(
     )
 
     if normalize is True:
+        backend.assert_allclose(backend.abs(eigenvalues[0]) < PRECISION_TOL, True)
+        backend.assert_allclose(backend.abs(eigenvalues[1] - 1) < PRECISION_TOL, True)
         backend.assert_allclose(
-            np.abs(backend.to_numpy(eigenvalues[0])) < PRECISION_TOL, True
-        )
-        backend.assert_allclose(
-            np.abs(backend.to_numpy(eigenvalues[1]) - 1) < PRECISION_TOL, True
-        )
-        backend.assert_allclose(
-            np.abs(backend.to_numpy(eigenvalues[-1]) - max_eigenvalue) < PRECISION_TOL,
+            backend.abs(eigenvalues[-1] - max_eigenvalue) < PRECISION_TOL,
             True,
         )
 
@@ -493,3 +635,102 @@ def test_random_stochastic_matrix(backend):
     # tests warning for max_iterations
     dims = 4
     random_stochastic_matrix(dims, bistochastic=True, max_iterations=1, backend=backend)
+
+
+def test_random_pauli_hamiltonian_tensorflow(backend):
+    """Test ``random_pauli_hamiltonian`` with a tensorflow backend to cover
+    the ``to_numpy`` conversion."""
+    # Create a mock backend with platform="tensorflow"
+    mock_backend = MagicMock()
+    mock_backend.platform = "tensorflow"
+    mock_backend.name = "tensorflow"
+    mock_backend.set_seed = MagicMock()
+
+    # eigenvectors returns (eigenvalues, eigenvectors)
+    d = 4  # 2 qubits
+    mock_eigenvalues = np.array([0.0, 1.0, 2.0, 3.0])
+    mock_eigenvectors = np.eye(4)
+    mock_backend.eigenvectors.return_value = (mock_eigenvalues, mock_eigenvectors)
+
+    # to_numpy returns the input as-is
+    mock_backend.to_numpy.side_effect = lambda x: x
+
+    # random_hermitian needs to work - patch it to return a simple matrix
+    mock_hamiltonian = np.eye(d)
+    with (
+        patch(
+            "qibo.quantum_info.random_ensembles.random_hermitian",
+            return_value=mock_hamiltonian,
+        ),
+        patch(
+            "qibo.quantum_info.random_ensembles._check_backend",
+            return_value=mock_backend,
+        ),
+    ):
+        result = random_pauli_hamiltonian(
+            nqubits=2, normalize=False, seed=42, backend=mock_backend
+        )
+        assert result is not None
+
+
+@pytest.mark.parametrize(
+    "function",
+    [
+        lambda seed, backend: random_gaussian_matrix(3, seed=seed, backend=backend),
+        lambda seed, backend: random_hermitian(3, seed=seed, backend=backend),
+        lambda seed, backend: random_unitary(3, seed=seed, backend=backend),
+        lambda seed, backend: random_statevector(4, seed=seed, backend=backend),
+        lambda seed, backend: random_density_matrix(4, seed=seed, backend=backend),
+        lambda seed, backend: random_quantum_channel(4, seed=seed, backend=backend),
+        lambda seed, backend: random_pauli(
+            2, 2, return_circuit=False, seed=seed, backend=backend
+        ),
+        lambda seed, backend: random_pauli_hamiltonian(2, seed=seed, backend=backend)[
+            0
+        ],
+    ],
+)
+def test_random_functions_accept_generator_seed(backend, function):
+    first = function(backend.default_rng(1234), backend)
+    second = function(backend.default_rng(1234), backend)
+    other = function(backend.default_rng(4321), backend)
+
+    backend.assert_allclose(first, second)
+    assert not backend.allclose(first, other)
+
+    # integer seeds are unchanged
+    backend.assert_allclose(function(7, backend), function(7, backend))
+
+
+def test_random_density_matrix_pauli_basis_default_order(backend):
+    default = random_density_matrix(4, basis="pauli", seed=5, backend=backend)
+    explicit = random_density_matrix(4, basis="pauli-IXYZ", seed=5, backend=backend)
+
+    backend.assert_allclose(default, explicit)
+
+
+def test_random_quantum_channel_invalid_measure(backend):
+    with pytest.raises(ValueError):
+        random_quantum_channel(4, measure="invalid", backend=backend)
+
+
+@pytest.mark.parametrize("nqubits", [2, 3])
+@pytest.mark.parametrize("max_eigenvalue", [1.2, 1.5, 3.0, 10.0])
+def test_random_pauli_hamiltonian_spectrum(backend, nqubits, max_eigenvalue):
+    hamiltonian, eigenvalues = random_pauli_hamiltonian(
+        nqubits, max_eigenvalue=max_eigenvalue, normalize=True, seed=2, backend=backend
+    )
+    dims = 2**nqubits
+
+    # back to the computational basis
+    vector = pauli_to_comp_basis(nqubits, normalize=True, backend=backend) @ hamiltonian
+    matrix = vector.reshape(dims, dims)
+    matrix = (matrix + backend.dagger(matrix)) / 2
+    spectrum = backend.sort(backend.eigvalsh(matrix))
+
+    # returned eigenvalues are the spectrum of the Hamiltonian, with unit gap
+    backend.assert_allclose(
+        spectrum, backend.sort(backend.real(eigenvalues)), atol=1e-8
+    )
+    backend.assert_allclose(spectrum[:2], [0.0, 1.0], atol=1e-8)
+    backend.assert_allclose(spectrum[-1], max_eigenvalue, atol=1e-8)

@@ -2,6 +2,7 @@
 
 import math
 from inspect import signature
+from itertools import combinations
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -19,6 +20,7 @@ from qibo.models._encodings import (  # _up_to_k_hamming_weight_encoder_deprecat
     _binary_encoder_hyperspherical,
     _binary_encoder_mottonen,
     _ehrlich_algorithm,
+    _fanout_parity_tree,
     _generate_rbs_angles,
     _generate_rbs_pairs,
     _get_gate,
@@ -32,6 +34,7 @@ from qibo.models._encodings import (  # _up_to_k_hamming_weight_encoder_deprecat
     _sparse_encoder_farias,
     _sparse_encoder_li,
     _up_to_k_encoder_hyperspherical,
+    _walsh_gray_code,
 )
 from qibo.models.circuit import Circuit
 
@@ -342,16 +345,19 @@ def entangling_layer(
     Args:
         nqubits (int): Total number of qubits in the circuit.
         architecture (str, optional): Architecture of the entangling layer.
-            In alphabetical order, options are ``"diagonal"``, ``"even_layer"``,
-            ``"next_nearest"``, ``"odd_layer"``, ``"pyramid"``, ``"shifted"``,
-            ``"v"``, and ``"x"``. The ``"x"`` architecture is only defined for an even number
-            of qubits. Defaults to ``"diagonal"``.
+            In alphabetical order, options are ``"all-to-all"``, ``"diagonal"``,
+            ``"even_layer"``, ``"next_nearest"``, ``"odd_layer"``, ``"pyramid"``,
+            ``"shifted"``, ``"v"``, and ``"x"``. The ``"all-to-all"`` architecture acts on
+            all pairs of qubits :math:`(j, k)` with :math:`j < k`, ordered such that the depth
+            of the layer is minimal: :math:`n - 1` for even :math:`n` and :math:`n` for odd
+            :math:`n`. The ``"x"`` architecture is only defined for an even number of qubits.
+            Defaults to ``"diagonal"``.
         entangling_gate (str or :class:`qibo.gates.Gate`, optional): Two-qubit gate to be used
             in the entangling layer. If ``entangling_gate`` is a parametrized gate,
             all phases are initialized as :math:`0.0`. Defaults to  ``"CNOT"``.
         closed_boundary (bool, optional): If ``True`` and ``architecture not in
-            ["pyramid", "v", "x"]``, adds a closed-boundary condition to the entangling layer.
-            Defaults to ``False``.
+            ["all-to-all", "pyramid", "v", "x"]``, adds a closed-boundary condition to the
+            entangling layer. Defaults to ``False``.
         kwargs (dict, optional): Additional arguments used to initialize a Circuit object.
             For details, see the documentation of :class:`qibo.models.circuit.Circuit`.
 
@@ -376,6 +382,7 @@ def entangling_layer(
         )
 
     if architecture not in [
+        "all-to-all",
         "diagonal",
         "even_layer",
         "next_nearest",
@@ -435,21 +442,41 @@ def entangling_layer(
 
         circuit = Circuit(nqubits, **kwargs)
 
-        if architecture == "diagonal":
-            qubits = range(nqubits - 1)
-        elif architecture == "even_layer":
-            qubits = range(0, nqubits - 1, 2)
-        elif architecture == "odd_layer":
-            qubits = range(1, nqubits - 1, 2)
+        if architecture == "all-to-all":
+            # Edge colouring of the complete graph: each colour is a set of disjoint pairs
+            # that can be applied in parallel, which minimizes the depth of the layer to
+            # ``nqubits - 1`` (even ``nqubits``) or ``nqubits`` (odd ``nqubits``).
+            modulus = nqubits - 1 if nqubits % 2 == 0 else nqubits
+            pairs = []
+            for color in range(modulus):
+                pairs.extend(
+                    (qubit_0, qubit_1)
+                    for qubit_0, qubit_1 in combinations(range(modulus), 2)
+                    if (qubit_0 + qubit_1) % modulus == color
+                )
+                if nqubits % 2 == 0:
+                    # the qubit left out of this colour is paired with the last qubit
+                    pairs.append((color * (modulus + 1) // 2 % modulus, nqubits - 1))
         else:
-            qubits = tuple(range(0, nqubits - 1, 2)) + tuple(range(1, nqubits - 1, 2))
+            if architecture == "diagonal":
+                qubits = range(nqubits - 1)
+            elif architecture == "even_layer":
+                qubits = range(0, nqubits - 1, 2)
+            elif architecture == "odd_layer":
+                qubits = range(1, nqubits - 1, 2)
+            else:
+                qubits = tuple(range(0, nqubits - 1, 2)) + tuple(
+                    range(1, nqubits - 1, 2)
+                )
+
+            pairs = ((qubit, qubit + 1) for qubit in qubits)
 
         circuit.add(
-            _parametrized_two_qubit_gate(gate, qubit, qubit + 1, parameters)
-            for qubit in qubits
+            _parametrized_two_qubit_gate(gate, qubit_0, qubit_1, parameters)
+            for qubit_0, qubit_1 in pairs
         )
 
-        if closed_boundary:
+        if closed_boundary and architecture != "all-to-all":
             circuit.add(_parametrized_two_qubit_gate(gate, nqubits - 1, 0, parameters))
 
     return circuit
@@ -458,6 +485,7 @@ def entangling_layer(
 def fanout_synthesis(
     qubits: list[int] | tuple[int],
     nqubits: int | None = None,
+    method: str | None = None,
     **kwargs,
 ) -> Circuit:
     """Synthesis of the Fanout gate in logarithmic depth.
@@ -468,6 +496,9 @@ def fanout_synthesis(
         qubits (list[int] | tuple[int]): qubits in which the CNOT ladder acts on.
         nqubits (int, optional): total number of qubits in the circuit. To be used when
             the total number of qubits differ from `len(qubits)`. Defaults to ``None``.
+        method (str, optional): if `"parity"`, return a fanout decomposition based on parity trees.
+            If ``None``, return a decomposition based on CNOT-ladder synthesis.
+            Defaults to ``None``.
 
     Returns:
         :class:`qibo.models.circuit.Circuit`: Circuit containing the sequence of gates in parallel.
@@ -479,6 +510,14 @@ def fanout_synthesis(
         Springer, Cham. (2025) <https://doi.org/10.1103/PhysRevApplied.23.044014>`_.
 
     """
+
+    if method not in (None, "parity"):
+        raise_error(
+            ValueError, f"Unknown method {method!r}. Expected ``None`` or 'parity'."
+        )
+
+    if method == "parity":
+        return _fanout_parity_tree(qubits, nqubits, **kwargs)
 
     if nqubits is None:
         if set(qubits) != set(range(len(qubits))):
@@ -767,8 +806,8 @@ def permutation_synthesis(
     and a power‑of‑two budget ``m``, this function factors ``sigma``
     into the fewest layers :math:`\\sigma_{1}, \\, \\sigma_{2}, \\, \\cdots, \\, \\sigma_{t}`
     such that:
-        - each layer has at most :math:`m` disjoint transpositions;
-        - each layer moves a power‑of‑two number of indices.
+    - each layer has at most :math:`m` disjoint transpositions;
+    - each layer moves a power‑of‑two number of indices.
 
     The function returns a circuit synthesis of ``sigma``.
 
@@ -975,6 +1014,206 @@ def sparse_encoder(
     func = _sparse_encoder_farias if method == "farias" else _sparse_encoder_li
 
     return func(data, nqubits, backend, **kwargs)
+
+
+def spin_s_encoder(
+    nqudits: int,
+    spin: float,
+    weight: int,
+    data: ArrayLike | None = None,
+    complex_data: bool = False,
+    encoding: str = "unary",
+    optimize_controls: bool = True,
+    phase_correction: bool = True,
+    backend: Backend | None = None,
+    **kwargs,
+) -> Circuit:
+    """Create circuit encoding ``data`` in a fixed-:math:`S^{z}` subspace of a spin-:math:`s` chain.
+
+    Let :math:`\\mathbf{x}` be a :math:`1`-dimensional array of size :math:`D` and
+    :math:`B_{k} \\equiv \\{ \\ket{\\mathbf{m}} : \\mathbf{m} \\in \\{0, 1, \\ldots, 2s\\}^{n}
+    \\,\\, \\text{and} \\,\\, \\sum_{r} m_{r} = k \\}` be the set of :math:`D` computational basis
+    states of :math:`n` spin-:math:`s` sites (equivalently, :math:`(2s + 1)`-level qudits) whose
+    ditstrings :math:`\\mathbf{m}` have fixed digit sum :math:`k`. Then, this function returns a
+    circuit :math:`\\operatorname{Load}_{B_{k}}` such that
+
+    .. math::
+        \\operatorname{Load}(\\mathbf{x}) \\, \\ket{0}^{\\otimes n} = \\frac{1}{\\|\\mathbf{x}\\|}
+            \\, \\sum_{j = 1}^{D} \\, x_{j} \\, \\ket{\\mathbf{m}_{j}} \\, ,
+
+    where the ditstrings :math:`\\mathbf{m}_{j}` are sorted in lexicographical order, with
+    site :math:`0` being the most significant digit. The construction follows Refs. [1, 2].
+    For :math:`s = 1/2`, this reduces to the fixed-Hamming-weight encoder of Ref. [3],
+    implemented in :func:`qibo.models.encodings.hamming_weight_encoder`.
+
+    Args:
+        nqudits (int): number of spin-:math:`s` sites :math:`n`.
+        spin (float): spin :math:`s \\in \\{1/2, \\, 1, \\, 3/2, \\, \\ldots\\}` of each site.
+        weight (int): digit sum :math:`k \\in \\{0, \\, 1, \\, \\ldots, \\, 2sn\\}` that defines the
+            subspace in which ``data`` will be encoded.
+        data (ArrayLike, optional): :math:`1`-dimensional array of data to be loaded. If ``None``,
+            circuit is returned with all phases set to :math:`0.0`. Defaults to ``None``.
+        complex_data (bool, optional): to be used when ``data is None``. If ``True``, returned
+            circuit parametrizes complex-valued states. If ``False``, it parametrizes
+            real-valued states. If ``data is not None``, then data type is inferred from ``data``.
+            Defaults to ``False``.
+        encoding (str, optional): mapping of each :math:`(2s + 1)`-level site into qubits.
+            Options are ``"unary"`` and ``"binary"``. Defaults to ``"unary"``.
+        optimize_controls (bool, optional): if ``True``, removes redundant controls on sites
+            that were not modified by previous Gray gates, following Sec. 2.2.1 of Ref. [1].
+            Defaults to ``True``.
+        phase_correction (bool, optional): To be used when ``data`` is complex-valued.
+            If ``True``, adds a controlled-:math:`\\mathrm{RZ}` gate to the end of the circuit,
+            adding a final phase correction. If ``False``, gate is not added. Defaults to ``True``.
+        backend (:class:`qibo.backends.abstract.Backend`, optional): backend to be used
+            in the execution. If ``None``, it uses the current backend. Defaults to ``None``.
+        kwargs (dict, optional): Additional arguments used to initialize a Circuit object.
+            For details, see the documentation of :class:`qibo.models.circuit.Circuit`.
+
+    Returns:
+        :class:`qibo.models.circuit.Circuit`: Circuit that loads ``data`` in the fixed-digit-sum
+        subspace of :math:`n` spin-:math:`s` sites.
+
+    References:
+        1. N. Zare Harofteh and R. I. Nepomechie, *Spin-s U(1)-eigenstate preparation*,
+        `Ann. Phys. (Berlin) 538, e70239 (2026) <https://doi.org/10.1002/andp.70239>`_.
+
+        2. T. R. Walsh, *Loop-free sequencing of bounded integer compositions*,
+        J. Comb. Math. Comb. Comp. 33, 323 (2000).
+
+        3. R. M. S. Farias, T. O. Maciel, G. Camilo, R. Lin, S. Ramos-Calderer, and L. Aolita,
+        *Quantum encoder for fixed-Hamming-weight subspaces*
+        `Phys. Rev. Applied 23, 044014 (2025) <https://doi.org/10.1103/PhysRevApplied.23.044014>`_.
+    """
+    backend = _check_backend(backend)
+
+    levels = 2 * spin
+    if levels < 1 or not float(levels).is_integer():
+        raise_error(
+            ValueError,
+            f"``spin`` must be a positive multiple of 1/2, but it is {spin}.",
+        )
+    levels = int(levels)
+
+    if not 0 <= weight <= levels * nqudits:
+        raise_error(
+            ValueError,
+            f"``weight`` must be in the interval [0, {levels * nqudits}], but it is {weight}.",
+        )
+
+    if encoding not in ("binary", "unary"):
+        raise_error(
+            ValueError,
+            f'``encoding`` must be either ``"binary"`` or ``"unary"``, but it is {encoding}.',
+        )
+
+    width = levels if encoding == "unary" else levels.bit_length()
+
+    # Gray code in qibo's site order: site 0 is the leftmost (most significant) digit
+    ditstrings = backend.flip(
+        _walsh_gray_code(nqudits, weight, levels, backend=backend), axis=1
+    )
+    dims = len(ditstrings)
+
+    if encoding == "unary":
+        bitstrings = backend.arange(width) >= width - ditstrings[:, :, None]
+    else:
+        shifts = backend.flip(backend.arange(width, dtype=backend.int64))
+        bitstrings = backend.right_shift(ditstrings[:, :, None], shifts) % 2
+    bitstrings = backend.cast(
+        backend.reshape(bitstrings, (dims, nqudits * width)), dtype=backend.int64
+    )
+
+    if data is None:
+        data = backend.cast(
+            [1] + [0] * (dims - 1),
+            dtype=backend.complex128 if complex_data else backend.float64,
+        )
+    else:
+        if len(data) != dims:
+            raise_error(
+                ValueError,
+                f"Data dimension should be {dims}, passed data has dims {len(data)}.",
+            )
+        complex_data = bool("complex" in str(data.dtype))
+
+    # sort data such that the encoding is performed in lexicographical order
+    # ditstrings as integers in base 2s + 1 to find their lexicographical ranks,
+    # i.e. the position of each Gray-code ditstring in lexicographical order
+    powers = (levels + 1) ** backend.flip(backend.arange(nqudits, dtype=backend.int64))
+    ranks = backend.argsort(backend.argsort(backend.sum(ditstrings * powers, axis=1)))
+    data = data[ranks]
+
+    circuit = Circuit(nqudits * width, **kwargs)
+    circuit.add(gates.X(int(qubit)) for qubit in backend.flatnonzero(bitstrings[0]))
+
+    if dims == 1:
+        return circuit
+
+    # Calculate all gate phases necessary to encode the amplitudes.
+    _data = backend.abs(data) if complex_data else data
+    thetas = _generate_rbs_angles(_data, architecture="diagonal", backend=backend)
+    phis = backend.zeros(len(thetas) + 1, dtype=float)
+    if complex_data:
+        phis[0] = _angle_mod_two_pi(-backend.angle(data[0]))
+        for k in range(1, len(phis)):
+            phis[k] = _angle_mod_two_pi(-backend.angle(data[k]) + backend.sum(phis[:k]))
+
+    # qubits currently conjugated by X gates to implement anti-controls
+    flipped = set()
+    untouched = {int(site) for site in backend.flatnonzero(ditstrings[0])}
+    for step, (theta, phi) in enumerate(zip(thetas, phis)):
+        source, target = bitstrings[step], bitstrings[step + 1]
+        qubits_in = [int(qubit) for qubit in backend.flatnonzero(source > target)]
+        qubits_out = [int(qubit) for qubit in backend.flatnonzero(target > source)]
+
+        # sites changed by the Gray gate and sites that may need controls (Eqs. 2.12 - 2.15)
+        pair = ditstrings[step + 1] != ditstrings[step]
+        pair = {int(site) for site in backend.flatnonzero(pair)}
+        if step > 0:
+            untouched -= pair
+        sites = {int(site) for site in backend.flatnonzero(ditstrings[step])} - pair
+        if optimize_controls:
+            sites -= untouched
+
+        # qubits that fix the levels of the controlled sites and of the pair of sites
+        controls = set()
+        for site in pair | sites:
+            if encoding == "unary":
+                values = {int(ditstrings[step][site]), int(ditstrings[step + 1][site])}
+                positions = {
+                    width - value + shift for value in values for shift in (-1, 0)
+                }
+                positions = {pos for pos in positions if 0 <= pos < width}
+            else:
+                positions = range(width)
+            controls |= {site * width + pos for pos in positions}
+        controls = sorted(controls - set(qubits_in) - set(qubits_out))
+        anticontrols = {qubit for qubit in controls if int(source[qubit]) == 0}
+
+        if len(qubits_in) == len(qubits_out) == 1:
+            gate_list = [gates.RBS(*qubits_in, *qubits_out, theta)]
+            if complex_data:
+                gate_list.extend(
+                    [gates.RZ(*qubits_in, -phi), gates.RZ(*qubits_out, phi)]
+                )
+        else:
+            gate_list = [gates.GeneralizedRBS(qubits_in, qubits_out, theta, -phi)]
+
+        if len(controls) > 0:
+            gate_list = [gate.controlled_by(*controls) for gate in gate_list]
+
+        # X gates shared by consecutive anti-controlled gates cancel out
+        circuit.add(gates.X(qubit) for qubit in sorted(flipped ^ anticontrols))
+        circuit.add(gate_list)
+        flipped = anticontrols
+
+    circuit.add(gates.X(qubit) for qubit in sorted(flipped))
+
+    if complex_data and phase_correction:
+        circuit.add(_get_phase_gate_correction(bitstrings[-1], phis[-1]))
+
+    return circuit
 
 
 def unary_encoder(

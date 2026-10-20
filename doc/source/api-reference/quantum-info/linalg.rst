@@ -1,0 +1,100 @@
+Linear Algebra Operations
+=========================
+
+Collection of linear algebra operations that are commonly used in quantum information theory.
+
+
+Anticommutator
+--------------
+
+.. autofunction:: qibo.quantum_info.anticommutator
+
+
+Commutator
+----------
+
+.. autofunction:: qibo.quantum_info.commutator
+
+
+Double commutator
+-----------------
+
+.. autofunction:: qibo.quantum_info.double_commutator
+
+
+Group commutator
+----------------
+
+.. autofunction:: qibo.quantum_info.group_commutator
+
+
+Partial trace
+-------------
+
+.. autofunction:: qibo.quantum_info.partial_trace
+
+
+Partial transpose
+-----------------
+
+.. autofunction:: qibo.quantum_info.partial_transpose
+
+
+Matrix exponentiation
+---------------------
+
+.. autofunction:: qibo.quantum_info.matrix_exponentiation
+
+
+Matrix logarithm
+----------------
+
+.. autofunction:: qibo.quantum_info.matrix_logarithm
+
+
+Matrix power
+------------
+
+.. autofunction:: qibo.quantum_info.matrix_power
+
+
+Matrix square root
+------------------
+
+.. autofunction:: qibo.quantum_info.matrix_sqrt
+
+
+Cosine-Sine decomposition
+-------------------------
+
+.. autofunction:: qibo.quantum_info.cosine_sin_decomposition
+
+
+Schur decomposition
+-------------------
+
+.. autofunction:: qibo.quantum_info.schur_decomposition
+
+
+Singular value decomposition
+----------------------------
+
+.. autofunction:: qibo.quantum_info.singular_value_decomposition
+
+
+Schmidt decomposition
+---------------------
+
+.. autofunction:: qibo.quantum_info.schmidt_decomposition
+
+
+Lanczos algorithm
+-----------------
+
+.. autofunction:: qibo.quantum_info.lanczos
+
+
+Lie closure
+-----------
+
+.. autofunction:: qibo.quantum_info.lie_closure

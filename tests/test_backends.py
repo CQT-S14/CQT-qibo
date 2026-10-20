@@ -7,6 +7,7 @@ import pytest
 import qibo
 from qibo import Circuit, construct_backend, gates, list_available_backends, set_backend
 from qibo.backends import MetaBackend
+from qibo.quantum_info.random_ensembles import random_unitary
 
 from .conftest import AVAILABLE_BACKENDS
 
@@ -208,6 +209,201 @@ def test_minus_state(backend, nqubits, density_matrix):
     backend.assert_allclose(state, target)
 
 
+@pytest.mark.parametrize("nqubits", [2, 3, 4])
+def test_dagger(backend, nqubits):
+    for matrix in (backend.matrices.X, backend.matrices.Y, backend.matrices.Z):
+        backend.assert_allclose(backend.dagger(matrix), matrix)
+
+    rand = random_unitary(2**nqubits, backend=backend)
+    backend.assert_allclose(backend.dagger(rand), backend.inv(rand))
+
+
+@pytest.mark.parametrize("size_1,size_2", [(3, 3), (5, 2)])
+def test_convolve(backend, size_1, size_2):
+    backend.set_seed(42)
+    array_1 = backend.random_normal(0, 1, size_1) + 1j * backend.random_normal(
+        0, 1, size_1
+    )
+    array_2 = backend.random_normal(0, 1, size_2) + 1j * backend.random_normal(
+        0, 1, size_2
+    )
+
+    target = np.convolve(backend.to_numpy(array_1), backend.to_numpy(array_2))
+
+    backend.assert_allclose(backend.convolve(array_1, array_2), target)
+
+
+@pytest.mark.parametrize("mode", ["full", "same", "valid"])
+def test_convolve_mode(backend, mode):
+    backend.set_seed(42)
+    array_1 = backend.random_normal(0, 1, 6)
+    array_2 = backend.random_normal(0, 1, 3)
+
+    target = np.convolve(
+        backend.to_numpy(array_1), backend.to_numpy(array_2), mode=mode
+    )
+
+    backend.assert_allclose(backend.convolve(array_1, array_2, mode=mode), target)
+
+
+def test_create_dtype(backend):
+    """``backend.create_dtype`` matches ``numpy.dtype``."""
+    assert backend.create_dtype("uint8") == np.dtype("uint8")
+    void = backend.create_dtype("V3")
+    assert void == np.dtype((np.void, 3)) and void.itemsize == 3
+    packed = backend.packbits(backend.cast(np.eye(4), dtype=backend.uint8), axis=1)
+    assert backend.reshape(packed.view(backend.create_dtype("V1")), (-1,)).shape == (4,)
+
+
+@pytest.mark.parametrize("size", [4, 7])
+def test_fft_ifft(backend, size):
+    backend.set_seed(42)
+    array = backend.random_normal(0, 1, size) + 1j * backend.random_normal(0, 1, size)
+    array_numpy = backend.to_numpy(array)
+
+    backend.assert_allclose(backend.fft(array), np.fft.fft(array_numpy))
+    backend.assert_allclose(backend.ifft(array), np.fft.ifft(array_numpy))
+    backend.assert_allclose(backend.ifft(backend.fft(array)), array)
+
+
+def test_frombuffer_packbits(backend):
+    """``backend.frombuffer`` and ``backend.packbits`` match their ``numpy`` counterparts."""
+    buffer = b"IXYZ"
+    backend.assert_allclose(
+        backend.frombuffer(buffer, dtype=backend.uint8),
+        backend.cast(np.frombuffer(buffer, dtype=np.uint8), dtype=backend.uint8),
+    )
+
+    bits = np.array([[1, 0, 1, 1, 0, 0, 1, 0, 1], [0, 1, 1, 0, 1, 0, 0, 1, 1]])
+    for axis in (None, 0, 1):
+        backend.assert_allclose(
+            backend.packbits(backend.cast(bits, dtype=backend.uint8), axis=axis),
+            backend.cast(np.packbits(bits, axis=axis), dtype=backend.uint8),
+        )
+
+
+def test_searchsorted(backend):
+    """``backend.searchsorted`` matches ``np.searchsorted``."""
+    array_1 = backend.cast(np.array([1, 3, 5, 7]))
+    array_2 = backend.cast(np.array([2, 4, 6]))
+    result = backend.searchsorted(array_1, array_2)
+    backend.assert_allclose(
+        result, backend.cast(np.searchsorted([1, 3, 5, 7], [2, 4, 6]))
+    )
+    # scalar second argument returns an integer insertion point
+    scalar_result = backend.searchsorted(array_1, backend.cast(np.array(4)))
+    assert int(scalar_result) == int(np.searchsorted([1, 3, 5, 7], 4))
+
+
+@pytest.mark.parametrize("degree", [2, 4])
+def test_poly_roots(backend, degree):
+    backend.set_seed(42)
+    roots = backend.random_normal(0, 1, degree) + 1j * backend.random_normal(
+        0, 1, degree
+    )
+    roots_numpy = backend.to_numpy(roots)
+
+    coefficients = backend.poly(roots)
+    backend.assert_allclose(coefficients, np.poly(roots_numpy))
+
+    test = backend.to_numpy(backend.roots(coefficients))
+    backend.assert_allclose(np.sort_complex(test), np.sort_complex(roots_numpy))
+
+
+@pytest.mark.parametrize("size", [2, 3])
+def test_poly_matrix(backend, size):
+    backend.set_seed(42)
+    matrix = backend.random_normal(0, 1, (size, size)) + 1j * backend.random_normal(
+        0, 1, (size, size)
+    )
+
+    target = np.poly(backend.to_numpy(matrix))
+
+    backend.assert_allclose(backend.poly(matrix), target)
+
+
+@pytest.mark.parametrize("size", [2, 4, 8])
+def test_schur(backend, size):
+    backend.set_seed(42)
+    matrix = backend.random_normal(0, 1, (size, size)) + 1j * backend.random_normal(
+        0, 1, (size, size)
+    )
+    identity = backend.identity(size)
+
+    triangular, unitary = backend.schur(matrix, output="complex")
+
+    backend.assert_allclose(unitary @ backend.conj(unitary).T, identity, atol=1e-8)
+    backend.assert_allclose(
+        unitary @ triangular @ backend.conj(unitary).T, matrix, atol=1e-8
+    )
+    lower = np.tril(backend.to_numpy(triangular), k=-1)
+    backend.assert_allclose(lower, np.zeros_like(lower), atol=1e-8)
+
+
+@pytest.mark.parametrize("degenerate", [False, True])
+@pytest.mark.parametrize("size", [4, 8])
+def test_schur_normal(backend, size, degenerate):
+    if degenerate:
+        phases = np.repeat(np.exp(1j * np.array([0.3, 1.1, -0.7, 2.0])), size // 4)
+    else:
+        phases = np.exp(1j * np.linspace(0.1, 2.0, size))
+    basis = random_unitary(size, seed=42, backend=backend)
+    matrix = basis @ backend.cast(np.diag(phases)) @ backend.conj(basis).T
+
+    triangular, unitary = backend.schur(matrix, output="complex")
+
+    # the Schur form of a normal matrix is diagonal, even with repeated eigenvalues
+    triangular = backend.to_numpy(triangular)
+    backend.assert_allclose(triangular, np.diag(np.diag(triangular)), atol=1e-8)
+    backend.assert_allclose(
+        unitary @ backend.cast(triangular) @ backend.conj(unitary).T,
+        matrix,
+        atol=1e-8,
+    )
+
+
+def test_schur_real(backend):
+    backend.set_seed(42)
+    matrix = backend.random_normal(0, 1, (4, 4))
+
+    quasi_triangular, orthogonal = backend.schur(matrix)
+
+    backend.assert_allclose(
+        orthogonal @ quasi_triangular @ backend.transpose(orthogonal), matrix, atol=1e-8
+    )
+
+
+@pytest.mark.parametrize("axis", [None, 0, 1])
+def test_argmax(backend, axis):
+    backend.set_seed(42)
+    array = backend.random_normal(0, 1, (4, 5))
+
+    target = np.argmax(backend.to_numpy(array), axis=axis)
+    target = backend.cast(target, dtype=target.dtype)
+
+    backend.assert_allclose(backend.argmax(array, axis=axis), target)
+
+
+@pytest.mark.parametrize("base", [2, 3, 8, 16])
+@pytest.mark.parametrize("number", [0, 5, 37, 255])
+def test_base_repr(backend, number, base):
+    target = np.base_repr(number, base)
+    assert backend.base_repr(number, base) == target
+
+
+def test_base_repr_length(backend):
+    assert backend.base_repr(5, 2, length=6) == np.binary_repr(5, width=6)
+    assert backend.base_repr(5, 3, padding=3) == np.base_repr(5, 3, padding=3)
+
+
+@pytest.mark.parametrize("length", [None, 8])
+@pytest.mark.parametrize("number", [0, 5, 37, -3])
+def test_binary_repr(backend, number, length):
+    target = np.binary_repr(number, width=length)
+
+    assert backend.binary_repr(number, length) == target
+
+
 def test_set_backend_error():
     with pytest.raises(ValueError):
         set_backend("non-existing-backend")
@@ -264,3 +460,18 @@ def test_list_available_backends():
         "qibolab",
         "qibo-cloud-backends",  # , "qibotn", "qiboml"
     )
+
+
+def test_oom_error(backend):
+    """Test that OOM error is caught and re-raised as RuntimeError."""
+    circuit = Circuit(2)
+    circuit.add(gates.X(0))
+
+    # Mock _execute_circuit to raise MemoryError
+    with (
+        mock.patch.object(
+            type(backend), "_execute_circuit", side_effect=MemoryError("out of memory")
+        ),
+        pytest.raises(RuntimeError, match="State does not fit"),
+    ):
+        backend.execute_circuit(circuit)

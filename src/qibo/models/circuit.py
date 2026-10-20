@@ -153,7 +153,7 @@ class Circuit:
         circuit = Circuit(5, wire_names=["A", "B", "C", "D", "E"])
         circuit = Circuit(wire_names=["A", "B", "C", "D", "E"])
 
-    Args:
+    Attributes:
         nqubits (int | list, optional): Number of qubits in the circuit or a list of wire names.
         wire_names (list, optional): List of wire names
         init_kwargs (dict): a dictionary with the following keys
@@ -526,7 +526,10 @@ class Circuit:
         """Decomposes circuit's gates to gates supported by OpenQASM.
 
         Args:
-            free (int): Ids of free (work) qubits to use for gate decomposition.
+            free (int): Ids of free (work) qubits that can be used as dirty auxiliary
+                qubits in the decomposition of multi-controlled gates, that is, they
+                can be in any state and are left unchanged. They must not be
+                qubits that the decomposed gates act on.
             method (str, optional): Choice of gate set for the decomposition.
                 If ``"standard"``, decomposes circuit into :class:`qibo.gates.gates.CNOT`,
                 :class:`qibo.gates.gates.RX`, :class:`qibo.gates.gates.RY`,
@@ -537,6 +540,10 @@ class Circuit:
                 :class:`qibo.gates.gates.S`, :class:`qibo.gates.gates.X`,
                 :class:`qibo.gates.gates.Y`, :class:`qibo.gates.gates.Z`,
                 and :class:`qibo.gates.gates.T`. Defaults to ``"standard"``.
+            kwargs (dict, optional): Additional arguments passed to
+                :meth:`qibo.gates.abstract.Gate.decompose` for each gate. For example,
+                ``clean``, ``minimize_toffolis`` and ``minimize_depth`` select
+                other decompositions of multi-controlled gates.
 
         Returns:
             :class:`qibo.models.circuit.Circuit`: Circuit that contains only
@@ -981,29 +988,29 @@ class Circuit:
         the all gates sorted in decreasing number of appearance.
 
         Example:
-            .. code-block:: python
-                from qibo import Circuit, gates
 
-                circuit = Circuit(3)
-                circuit.add(gates.H(0))
-                circuit.add(gates.H(1))
-                circuit.add(gates.CNOT(0, 2))
-                circuit.add(gates.CNOT(1, 2))
-                circuit.add(gates.H(2))
-                circuit.add(gates.TOFFOLI(0, 1, 2))
+        .. code-block:: python
 
-                circuit.summary()
+            from qibo import Circuit, gates
 
-                # Prints
-                '''
-                Circuit depth = 5
-                Total number of gates = 6
-                Number of qubits = 3
-                Most common gates:
-                h: 3
-                cx: 2
-                ccx: 1
-                '''
+            circuit = Circuit(3)
+            circuit.add(gates.H(0))
+            circuit.add(gates.H(1))
+            circuit.add(gates.CNOT(0, 2))
+            circuit.add(gates.CNOT(1, 2))
+            circuit.add(gates.H(2))
+            circuit.add(gates.TOFFOLI(0, 1, 2))
+
+            circuit.summary()
+
+            # Output:
+            # Circuit depth = 5
+            # Total number of gates = 6
+            # Number of qubits = 3
+            # Most common gates:
+            # h: 3
+            # cx: 2
+            # ccx: 1
         """
         sys.stdout.write(self.summary_string() + "\n")
 
@@ -1172,9 +1179,27 @@ class Circuit:
 
     @property
     def raw(self) -> dict:
-        """Serialize to dictionary.
+        """Serialize the circuit to a JSON-compatible dictionary.
 
-        This is a thin wrapper over :meth:`Gate.raw`.
+        This is a thin wrapper over :meth:`qibo.gates.Gate.raw`. The returned
+        dictionary has the following structure:
+
+        .. code-block:: text
+
+            {
+                "queue": [ <gate.raw>, ... ],  # list of serialized gates
+                "nqubits": int,                # number of qubits
+                "density_matrix": bool,        # whether a density matrix is used
+                "wire_names": list | None,     # wire names (or None)
+                "qibo_version": str,           # qibo version used for serialization
+            }
+
+        Each entry of ``queue`` is the output of :meth:`qibo.gates.Gate.raw`.
+        The dictionary can be loaded back into a circuit with
+        :meth:`qibo.models.circuit.Circuit.from_dict`.
+
+        Returns:
+            dict: JSON-compatible representation of the circuit.
         """
         queue = []
         # conditions refer to the measurements preceding them by position
@@ -1490,6 +1515,7 @@ class Circuit:
         idx: list[int],
         gate: Gate,
         gate_symbol: str | None = None,
+        parallel: bool = False,
     ) -> tuple[ArrayLike, list[int]]:
         """Helper method for :meth:`qibo.models.circuit.Circuit.draw`."""
         if gate_symbol is None:
@@ -1509,21 +1535,28 @@ class Circuit:
             targets = list(gate.target_qubits)
         controls = list(gate.control_qubits)
 
-        # identify boundaries
-        qubits = targets + controls
-        qubits.sort()
-        min_qubits_id = qubits[0]
-        max_qubits_id = qubits[-1]
+        # identify boundaries. The gate occupies every wire between its
+        # outermost qubits, since the vertical connector ``|`` is drawn
+        # on the wires in between.
+        qubits = sorted(targets + controls)
+        span = range(qubits[0], qubits[-1] + 1)
 
-        # identify column
-        col = idx[targets[0]] if not controls and len(targets) == 1 else max(idx)
+        # identify the wires that fix the column of this gate and that are
+        # advanced after drawing it. Single-qubit gates are always drawn in
+        # parallel. Multi-qubit gates block all wires unless ``parallel=True``,
+        # in which case they only block the wires in their span, so that gates
+        # acting on disjoint (and non-interleaved) sets of wires share a column.
+        wires = span if parallel or len(span) == 1 else range(self.nqubits)
+
+        # identify column: the earliest one that is free on every wire in ``wires``
+        col = max(idx[iq] for iq in wires)
 
         # extend matrix
         for iq in range(self.nqubits):
             matrix[iq].extend((1 + col - len(matrix[iq])) * [""])
 
         # fill
-        for iq in range(min_qubits_id, max_qubits_id + 1):
+        for iq in span:
             if iq in targets:
                 matrix[iq][col] = gate_symbol
             elif iq in controls:
@@ -1532,33 +1565,48 @@ class Circuit:
                 matrix[iq][col] = "|"
 
         # update indexes
-        if not controls and len(targets) == 1:
-            idx[targets[0]] += 1
-        else:
-            idx = [col + 1] * self.nqubits
+        for iq in wires:
+            idx[iq] = col + 1
 
         return matrix, idx
 
     def _draw_condition(
-        self, matrix: ArrayLike, idx: list[int], condition: "gates.ControlFlowOp"
+        self,
+        matrix: ArrayLike,
+        idx: list[int],
+        condition: "gates.ControlFlowOp",
+        parallel: bool = False,
     ) -> tuple[ArrayLike, list[int]]:
         """Helper method for drawing a control-flow operation with the gates of its
         branches between brackets, separated by ``][``."""
         matrix, idx = self._update_draw_matrix(
-            matrix, idx, condition, f"{condition.draw_label}["
+            matrix, idx, condition, f"{condition.draw_label}[", parallel=parallel
         )
         for i, body in enumerate(condition.branches):
             if i > 0:
-                matrix, idx = self._update_draw_matrix(matrix, idx, condition, "][")
+                matrix, idx = self._update_draw_matrix(
+                    matrix, idx, condition, "][", parallel=parallel
+                )
             for subgate in body:
                 if isinstance(subgate, gates.ControlFlowOp):
-                    matrix, idx = self._draw_condition(matrix, idx, subgate)
+                    matrix, idx = self._draw_condition(
+                        matrix, idx, subgate, parallel=parallel
+                    )
                 else:
-                    matrix, idx = self._update_draw_matrix(matrix, idx, subgate)
-        return self._update_draw_matrix(matrix, idx, condition, "]")
+                    matrix, idx = self._update_draw_matrix(
+                        matrix, idx, subgate, parallel=parallel
+                    )
+        return self._update_draw_matrix(
+            matrix, idx, condition, "]", parallel=parallel
+        )
 
-    def diagram(self, line_wrap: int = 70, legend: bool = False) -> str:
-        """Build the string representation of the circuit diagram."""
+    def diagram(
+        self, line_wrap: int = 100, legend: bool = False, parallel: bool = False
+    ) -> str:
+        """Build the string representation of the circuit diagram.
+
+        See :meth:`qibo.models.circuit.Circuit.draw` for the arguments.
+        """
         # build string representation of gates
         matrix = [[] for _ in range(self.nqubits)]
         wire_names = [str(name) for name in self.wire_names]
@@ -1569,12 +1617,18 @@ class Circuit:
         for gate in self.queue:
             if isinstance(gate, gates.FusedGate):
                 # start fused gate
-                matrix, idx = self._update_draw_matrix(matrix, idx, gate, "[")
+                matrix, idx = self._update_draw_matrix(
+                    matrix, idx, gate, "[", parallel=parallel
+                )
                 # draw gates contained in the fused gate
                 for subgate in gate.gates:
-                    matrix, idx = self._update_draw_matrix(matrix, idx, subgate)
+                    matrix, idx = self._update_draw_matrix(
+                        matrix, idx, subgate, parallel=parallel
+                    )
                 # end fused gate
-                matrix, idx = self._update_draw_matrix(matrix, idx, gate, "]")
+                matrix, idx = self._update_draw_matrix(
+                    matrix, idx, gate, "]", parallel=parallel
+                )
             elif isinstance(gate, gates.ControlFlowOp):
                 # draw the condition after the measurements it depends on
                 start = max(
@@ -1584,9 +1638,13 @@ class Circuit:
                 )
                 for q in gate.qubits:
                     idx[q] = max(idx[q], start)
-                matrix, idx = self._draw_condition(matrix, idx, gate)
+                matrix, idx = self._draw_condition(
+                    matrix, idx, gate, parallel=parallel
+                )
             else:
-                matrix, idx = self._update_draw_matrix(matrix, idx, gate)
+                matrix, idx = self._update_draw_matrix(
+                    matrix, idx, gate, parallel=parallel
+                )
             if isinstance(gate, gates.M):
                 measured[id(gate.result)] = max(idx[q] for q in gate.target_qubits)
 
@@ -1666,17 +1724,25 @@ class Circuit:
     def __str__(self):
         return self.diagram()
 
-    def draw(self, line_wrap: int = 70, legend: bool = False) -> None:
+    def draw(
+        self, line_wrap: int = 100, legend: bool = False, parallel: bool = False
+    ) -> None:
         """Draw text circuit using unicode symbols.
 
         Args:
             line_wrap (int, optional): maximum number of characters per line. This option
                 split the circuit text diagram in chunks of line_wrap characters.
-                Defaults to :math:`70`.
+                Defaults to :math:`100`.
             legend (bool, optional): If ``True`` prints a legend below the circuit for
                 callbacks and channels. Defaults to ``False``.
+            parallel (bool, optional): If ``True``, multi-qubit gates acting on disjoint
+                sets of wires are drawn in the same column, as single-qubit gates already
+                are. A gate occupies every wire between its outermost qubits, so gates
+                whose vertical connectors would cross are still drawn in separate columns.
+                If ``False``, each multi-qubit gate is drawn in its own column.
+                Defaults to ``False``.
         """
-        sys.stdout.write(self.diagram(line_wrap, legend) + "\n")
+        sys.stdout.write(self.diagram(line_wrap, legend, parallel) + "\n")
 
 
 def _resolve_qubits(

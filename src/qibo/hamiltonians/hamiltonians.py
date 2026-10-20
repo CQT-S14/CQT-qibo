@@ -79,8 +79,19 @@ class Hamiltonian(AbstractHamiltonian):
 
     @backend.setter
     def backend(self, new_backend: Backend) -> None:
+        old_backend = self._backend
         self._backend = new_backend
-        self._matrix = new_backend.cast(self._matrix, new_backend.dtype)
+        # bridge through numpy when possible: new_backend.cast can't assume
+        # self._matrix is a tensor type it understands (e.g. a cupy array,
+        # if switching away from a cupy backend). Some backends (e.g.
+        # CliffordBackend) don't implement to_numpy at all, since they're
+        # not meant to hold dense matrices this way; for those, cast
+        # self._matrix directly, matching the pre-existing behavior.
+        try:
+            matrix = old_backend.to_numpy(self._matrix)
+        except NotImplementedError:
+            matrix = self._matrix
+        self._matrix = new_backend.cast(matrix, dtype=new_backend.dtype)
 
     def eigenvalues(self, k: int = 6) -> ArrayLike:
         if self._eigenvalues is None:
@@ -331,6 +342,15 @@ class SymbolicHamiltonian(AbstractHamiltonian):
             Defaults to ``None``.
     """
 
+    # Derived, read-only attributes computed from ``form``; reassigning them
+    # would desynchronise them from ``form``, so block the write.
+    _READONLY_DERIVED = (
+        "terms",
+        "simple_terms",
+        "diagonal_terms",
+        "diagonal_simple_terms",
+    )
+
     def __init__(
         self,
         form: sympy.Expr,
@@ -353,6 +373,13 @@ class SymbolicHamiltonian(AbstractHamiltonian):
         )
         self._matrix = None
 
+    def __setattr__(self, name, value):
+        if name in self._READONLY_DERIVED:
+            raise AttributeError(
+                f"Cannot set read-only attribute {name!r}; it is derived from ``form``."
+            )
+        super().__setattr__(name, value)
+
     def __repr__(self) -> str:
         return str(self.form)
 
@@ -362,9 +389,21 @@ class SymbolicHamiltonian(AbstractHamiltonian):
 
     @backend.setter
     def backend(self, new_backend: Backend) -> None:
+        old_backend = self._backend
         self._backend = new_backend
         if self._matrix is not None:
-            self._matrix = new_backend.cast(self._matrix, new_backend.dtype)
+            # bridge through numpy when possible: new_backend.cast can't
+            # assume self._matrix is a tensor type it understands (e.g. a
+            # cupy array, if switching away from a cupy backend). Some
+            # backends (e.g. CliffordBackend) don't implement to_numpy at
+            # all, since they're not meant to hold dense matrices this way;
+            # for those, cast self._matrix directly, matching the
+            # pre-existing behavior.
+            try:
+                matrix = old_backend.to_numpy(self._matrix)
+            except NotImplementedError:
+                matrix = self._matrix
+            self._matrix = new_backend.cast(matrix, dtype=new_backend.dtype)
 
     @property
     def dense(self) -> Hamiltonian:
@@ -385,6 +424,12 @@ class SymbolicHamiltonian(AbstractHamiltonian):
             )
         self._form = form
         self.nqubits = _calculate_nqubits_from_form(form)
+        # Drop any cached derived values so they are recomputed from the new form.
+        # ``cached_property`` stores its value under the attribute name, so
+        # clearing it here forces recomputation from the new form.
+        for name in self._READONLY_DERIVED:
+            self.__dict__.pop(name, None)
+            self.__dict__.pop(f"_{name}", None)
 
     @cached_property
     def terms(self) -> list:
@@ -434,7 +479,7 @@ class SymbolicHamiltonian(AbstractHamiltonian):
     def diagonal_terms(self) -> list[list[SymbolicTerm]]:
         """List of terms that can be diagonalized simultaneously, i.e. that
         commute with each other. In detail each element of the list is a sublist
-        of commuting ``SymbolicTerm``s.
+        of commuting :class:`qibo.hamiltonians.terms.SymbolicTerm` terms.
         """
         diagonal_terms = []
         terms = self.terms

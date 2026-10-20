@@ -1,5 +1,7 @@
 from qibo.models import hep
+from qibo.models.block_encoding import block_encoding_circuit
 from qibo.models.circuit import Circuit
+from qibo.models.double_bracket import DoubleBracketIteration
 from qibo.models.encodings import (
     binary_encoder,
     comp_basis_encoder,
@@ -13,6 +15,7 @@ from qibo.models.encodings import (
     permutation_synthesis,
     phase_encoder,
     sparse_encoder,
+    spin_s_encoder,
     unary_encoder,
     unary_encoder_random_gaussian,
     up_to_k_hamming_weight_encoder,
@@ -20,7 +23,10 @@ from qibo.models.encodings import (
 from qibo.models.error_mitigation import CDR, ICS, ZNE, vnCDR
 from qibo.models.evolution import AdiabaticEvolution, StateEvolution
 from qibo.models.grover import Grover
+from qibo.models.lcu import lcu_circuit, lcu_prepare, lcu_select
 from qibo.models.qft import QFT
+from qibo.models.qsp import qsp_circuit, qsp_phases
+from qibo.models.qsvt import qsvt_circuit, qsvt_phases
 from qibo.models.variational import AAVQE, FALQON, QAOA, VQE
 
 __all__ = [
@@ -34,9 +40,11 @@ __all__ = [
     "ZNE",
     "AdiabaticEvolution",
     "Circuit",
+    "DoubleBracketIteration",
     "Grover",
     "StateEvolution",
     "binary_encoder",
+    "block_encoding_circuit",
     "comp_basis_encoder",
     "dicke_state",
     "entangling_layer",
@@ -46,9 +54,17 @@ __all__ = [
     "hamming_weight_encoder",
     "hep",
     "ladder_synthesis",
+    "lcu_circuit",
+    "lcu_prepare",
+    "lcu_select",
     "permutation_synthesis",
     "phase_encoder",
+    "qsp_circuit",
+    "qsp_phases",
+    "qsvt_circuit",
+    "qsvt_phases",
     "sparse_encoder",
+    "spin_s_encoder",
     "unary_encoder",
     "unary_encoder_random_gaussian",
     "up_to_k_hamming_weight_encoder",

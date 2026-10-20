@@ -170,31 +170,34 @@ def _binary_codewords(dims: int, backend: Backend | None = None) -> ArrayLike:
         cwres, cw = cw[dres:], cw[:dres]
 
         # keep weights for O(1) lookups
-        weights = backend.cast(
-            [hamming_weight(int(w)) for w in cw],
-            dtype=_get_int_type(n, backend=backend),
-        )
+        # done with plain Python lists rather than backend arrays because
+        # cupy has no equivalent of ``numpy.insert``
+        cw = [int(w) for w in cw]
+        weights = [hamming_weight(w) for w in cw]
 
         # insert the remainder words at positions that preserve
         # strictly increasing weights and distance ≤ 2 to neighbors
         for word in cwres:
-            hw = hamming_weight(int(word))
+            word = int(word)
+            hw = hamming_weight(word)
 
             inserted = False
             for i in range(len(cw) - 1):
                 wi, wj = weights[i], weights[i + 1]
                 if wi <= hw <= wj and (
-                    hamming_distance(int(word), int(cw[i])) <= 2
-                    and hamming_distance(int(word), int(cw[i + 1])) <= 2
+                    hamming_distance(word, cw[i]) <= 2
+                    and hamming_distance(word, cw[i + 1]) <= 2
                 ):
-                    cw = backend.engine.insert(cw, i + 1, word, axis=0)
-                    weights = backend.engine.insert(weights, i + 1, hw)
+                    cw.insert(i + 1, word)
+                    weights.insert(i + 1, hw)
                     inserted = True
                     break
             if not inserted:
                 # append if no suitable interior gap is found
-                cw = backend.engine.hstack((cw, word))
-                weights = backend.engine.hstack((weights, hw))
+                cw.append(word)
+                weights.append(hw)
+
+        cw = backend.cast(cw, dtype=_get_int_type(dims, backend=backend))
 
     return cw
 
@@ -269,37 +272,35 @@ def _binary_encoder_mottonen(
     for k in range(nqubits, 0, -1):
         alpha_y = _mottonen_alpha_y(amplitudes, nqubits, k, backend)
         target = nqubits - k
-        control = list(reversed(range(nqubits - k)))
-        theta_y = _mottonen_compute_theta(alpha_y, backend=backend)
-        if len(control) == 0:
-            circuit.add(gates.RY(target, theta_y[0]))
-            parameters.append(theta_y[0])
+        if target == 0:
+            circuit.add(gates.RY(target, alpha_y[0]))
+            parameters.append(alpha_y[0])
         else:
-            code = _mottonen_gray_code(len(control), backend=backend)
-            control_indices = backend.log2(code ^ backend.roll(code, -1))
-            control_indices = backend.cast(control_indices, dtype=backend.int64)
-            for i, control_index in enumerate(control_indices):
-                circuit.add(gates.RY(target, theta_y[i]))
-                circuit.add(gates.CNOT(control[control_index], target))
-                parameters.append(theta_y[i])
+            multiplexor = gates.Multiplexor(
+                list(range(target)), target, alpha_y, axis="y"
+            )
+            decomposed = multiplexor.decompose()
+            circuit.add(decomposed)
+            parameters.extend(
+                gate.parameters[0] for gate in decomposed if gate.parameters
+            )
 
     if complex_data or not backend.allclose(phases, 0):
         for k in range(nqubits, 0, -1):
             alpha_z = _mottonen_alpha_z(phases, nqubits, k, backend)
             target = nqubits - k
-            control = list(reversed(range(nqubits - k)))
-            theta_z = _mottonen_compute_theta(alpha_z, backend=backend)
-            if len(control) == 0:
-                circuit.add(gates.RZ(target, theta_z[0]))
-                parameters.append(theta_z[0])
+            if target == 0:
+                circuit.add(gates.RZ(target, alpha_z[0]))
+                parameters.append(alpha_z[0])
             else:
-                code = _mottonen_gray_code(len(control), backend=backend)
-                control_indices = backend.log2(code ^ backend.roll(code, -1))
-                control_indices = backend.cast(control_indices, dtype=backend.int64)
-                for i, control_index in enumerate(control_indices):
-                    circuit.add(gates.RZ(target, theta_z[i]))
-                    circuit.add(gates.CNOT(control[control_index], target))
-                    parameters.append(theta_z[i])
+                multiplexor = gates.Multiplexor(
+                    list(range(target)), target, alpha_z, axis="z"
+                )
+                decomposed = multiplexor.decompose()
+                circuit.add(decomposed)
+                parameters.extend(
+                    gate.parameters[0] for gate in decomposed if gate.parameters
+                )
 
         global_phase = -float(backend.sum(phases) / dims)
         if abs(global_phase) > np.finfo(float).eps:
@@ -441,14 +442,17 @@ def _ehrlich_algorithm(
     """
     k = np.unique(initial_string, return_counts=True)
     if len(k[1]) == 1:  # pragma: no cover
-        return ["".join([str(item) for item in np.array(initial_string)])]
+        return ["".join([str(item) for item in np.copy(initial_string)])]
 
     k = k[1][1]
     n = len(initial_string)
     n_choose_k = int(binom(n, k))
 
     markers = _get_markers(initial_string, last_run=False)
-    string = np.array(initial_string)
+    # np.array() forces a host copy and cupy disallows that implicit
+    # conversion; np.copy() dispatches through __array_function__ instead,
+    # which cupy supports, mirroring _get_next_bistring's usage below.
+    string = np.copy(initial_string)
     strings = ["".join(str(elem) for elem in string[::-1])]
     controls_and_targets = []
     for _ in range(n_choose_k - 1):
@@ -545,6 +549,73 @@ def _ehrlich_codewords_up_to_k(
         else:
             yield from k_seq
             last_emitted = k_seq[-1]
+
+
+def _fanout_parity_tree(
+    qubits: list[int] | tuple[int], nqubits: int | None = None, **kwargs
+) -> Circuit:
+    """Synthesis of :math:`k`-target fanout with a depth :math:`2 \\lceil \\log_{2} k \\rceil + 3`.
+
+    Since :math:`(H \\otimes H) \\, \\mathrm{CNOT}_{t \\to a} \\, (H \\otimes H) =
+    \\mathrm{CNOT}_{a \\to t}`, the fanout from :math:`a` to
+    :math:`t_{1}, \\dots, t_{k}` is equal to Hadamard gates on all these qubits, the
+    parity :math:`t_{1} \\oplus \\dots \\oplus t_{k}` added to :math:`a`, and Hadamard
+    gates on all these qubits again. The parity is computed in place on :math:`t_{1}` by
+    a binary tree of :class:`qibo.gates.CNOT` gates, added to :math:`a` by one
+    :class:`qibo.gates.CNOT` gate, and uncomputed by the reversed tree. With a single
+    target, the fanout is a single :class:`qibo.gates.CNOT` gate.
+
+    Args:
+        qubits (list[int] | tuple[int]): qubits in which the fanout acts on. The first
+            qubit is the control.
+        nqubits (int, optional): total number of qubits in the circuit. To be used when
+            the total number of qubits differ from ``len(qubits)``.
+            Defaults to ``None``.
+        kwargs (dict, optional): additional arguments used to initialize a Circuit
+            object. For details, see the documentation of
+            :class:`qibo.models.circuit.Circuit`.
+
+    Returns:
+        :class:`qibo.models.circuit.Circuit`: Fanout circuit.
+
+    References:
+        1. C. Moore, *Quantum circuits: fanout, parity, and counting*,
+        `arXiv:quant-ph/9903046 (1999) <https://arxiv.org/abs/quant-ph/9903046>`_.
+
+        2. F. Green, S. Homer, C. Moore, and C. Pollett, *Counting, fanout, and the
+        complexity of quantum ACC*, `Quantum Inf. Comput. 2, 35 (2002)
+        <https://arxiv.org/abs/quant-ph/0106017>`_.
+    """
+    if nqubits is None:
+        if set(qubits) != set(range(len(qubits))):
+            raise_error(
+                ValueError,
+                "`nqubits` must be specified when "
+                "`set(qubits) != set(range(len(qubits)))`.",
+            )
+        nqubits = len(qubits)
+
+    control, targets = qubits[0], list(qubits[1:])
+    circuit = Circuit(nqubits, **kwargs)
+    if len(targets) == 1:
+        circuit.add(gates.CNOT(control, targets[0]))
+        return circuit
+
+    tree, step = [], 1
+    while step < len(targets):
+        tree += [
+            (targets[index + step], targets[index])
+            for index in range(0, len(targets) - step, 2 * step)
+        ]
+        step *= 2
+
+    circuit.add(gates.H(qubit) for qubit in qubits)
+    circuit.add(gates.CNOT(source, target) for source, target in tree)
+    circuit.add(gates.CNOT(targets[0], control))
+    circuit.add(gates.CNOT(source, target) for source, target in reversed(tree))
+    circuit.add(gates.H(qubit) for qubit in qubits)
+
+    return circuit
 
 
 def _gate_params(
@@ -1213,9 +1284,11 @@ def _mottonen_alpha_y(
 
     denominator = backend.sum(amplitudes[indices_denominator] ** 2, axis=-1)
 
-    division = backend.where(denominator != 0.0, numerator / denominator, 0.0)
+    # ``numerator`` vanishes wherever ``denominator`` does, so replacing the
+    # latter by one yields zero angles without any 0 / 0 floating-point warning
+    denominator = backend.where(denominator != 0.0, denominator, 1.0)
 
-    return 2 * backend.arcsin(backend.sqrt(division))
+    return 2 * backend.arcsin(backend.sqrt(numerator / denominator))
 
 
 def _mottonen_alpha_z(
@@ -1231,52 +1304,6 @@ def _mottonen_alpha_z(
     indices_2 = indices_2 + backend.arange(2 ** (k - 1))[None]
 
     return backend.sum((phases[indices_1] - phases[indices_2]) / 2 ** (k - 1), axis=-1)
-
-
-def _mottonen_compute_theta(
-    alpha: ArrayLike, backend: Backend | None = None
-) -> ArrayLike:
-    """Map uniformly controlled rotation angles to Gray-code decomposition angles.
-
-    See Eq. (3) in Möttönen et al. (2004).
-    """
-    backend = _check_backend(backend)
-
-    alpha = backend.cast(alpha, dtype=backend.float64)
-    orig_shape = alpha.shape
-    nqubits = int(math.log2(orig_shape[-1]))
-    if nqubits == 0:
-        return alpha
-
-    broadcasted = len(orig_shape) > 1
-    new_shape = (orig_shape[0],) + (2,) * nqubits if broadcasted else (2,) * nqubits
-    theta = backend.reshape(alpha, new_shape)
-
-    hadamard = np.array([[1, 1], [1, -1]]) / 2
-    for i in range(broadcasted, nqubits + broadcasted):
-        theta = backend.tensordot(hadamard, theta, axes=[[1], [i]])
-
-    if nqubits > 1:
-        cnot = backend.reshape(backend.matrices.CNOT, (2, 2, 2, 2))
-        theta = backend.tensordot(
-            cnot, theta, axes=[[2, 3], [nqubits - 1, nqubits - 2]]
-        )
-        for i in range(broadcasted + 1, nqubits + broadcasted - 1):
-            theta = backend.tensordot(cnot, theta, axes=[[2, 3], [1, nqubits - 1]])
-        theta = backend.moveaxis(theta, 0, 1)
-
-    return backend.reshape(backend.transpose(theta), orig_shape)
-
-
-def _mottonen_gray_code(rank: int, backend: Backend | None = None) -> ArrayLike:
-    """Return Gray code of given rank as integer array."""
-    backend = _check_backend(backend)
-
-    code = backend.cast([0, 1], dtype=backend.int8)
-    for elem in range(1, rank):
-        code = backend.concatenate([code, code[::-1] + 2**elem])
-
-    return code
 
 
 def _next_nearest_layer(
@@ -1899,6 +1926,79 @@ def _v_layer(
     )
 
     return circuit
+
+
+def _walsh_gray_code(
+    nqudits: int, weight: int, levels: int, backend: Backend | None = None
+) -> ArrayLike:
+    """Return Walsh's Gray code for bounded integer compositions.
+
+    Generates all compositions :math:`(g_{1}, \\, \\ldots, \\, g_{n})` of ``weight``
+    :math:`k` into :math:`n` parts bounded as :math:`0 \\leq g_{i} \\leq 2s`, ordered such that
+    consecutive compositions differ by :math:`\\hat{e}_{i} - \\hat{e}_{j}` for some
+    :math:`i \\neq j`. The list starts at the lexicographically largest composition and ends
+    at the lexicographically smallest one. This is the non-recursive :math:`\\mathcal{O}(n)`
+    algorithm reviewed in Appendix A of Ref. [1], originally presented in Sec. 2 of Ref. [2].
+
+    Args:
+        nqudits (int): number of parts :math:`n`.
+        weight (int): integer :math:`k` to be composed.
+        levels (int): upper bound :math:`2s` of each part.
+        backend (:class:`qibo.backends.abstract.Backend`, optional): backend to be used
+            in the execution. If ``None``, it uses the current backend. Defaults to ``None``.
+
+    Returns:
+        ArrayLike: array of shape :math:`(D, n)` with the compositions in Gray-code order,
+        where :math:`D` is the number of bounded compositions.
+
+    References:
+        1. N. Zare Harofteh and R. I. Nepomechie, *Spin-s U(1)-eigenstate preparation*,
+        `Ann. Phys. (Berlin) 538, e70239 (2026) <https://doi.org/10.1002/andp.70239>`_.
+
+        2. T. R. Walsh, *Loop-free sequencing of bounded integer compositions*,
+        J. Comb. Math. Comb. Comp. 33, 323 (2000).
+    """
+    backend = _check_backend(backend)
+
+    # lexicographically largest composition
+    composition = backend.zeros(nqudits, dtype=backend.int64)
+    remainder = weight
+    for index in range(nqudits):
+        composition[index] = min(levels, remainder)
+        remainder -= min(levels, remainder)
+
+    prefix_capacities = levels * backend.arange(nqudits, dtype=backend.int64)
+    floor = backend.zeros(nqudits, dtype=backend.int64)
+    ceiling = floor + levels
+
+    compositions = [backend.copy(composition)]
+    while True:
+        # suffix sums S_{i}, and first and last values of each part relative to S_{i}
+        suffix_sums = backend.flip(backend.cumsum(backend.flip(composition)))
+        suffix_sums = suffix_sums - composition
+        lower = backend.maximum(floor, weight - suffix_sums - prefix_capacities)
+        upper = backend.minimum(ceiling, weight - suffix_sums)
+        last = backend.where(suffix_sums % 2 == 0, upper, lower)
+
+        pivots = backend.flatnonzero(composition[1:] != last[1:])
+        if len(pivots) == 0:
+            break
+        pivot = int(pivots[0]) + 1
+        composition[pivot] += 1 if int(suffix_sums[pivot]) % 2 == 0 else -1
+
+        suffix_sums = backend.flip(backend.cumsum(backend.flip(composition)))
+        suffix_sums = suffix_sums - composition
+        lower = backend.maximum(floor, weight - suffix_sums - prefix_capacities)
+        upper = backend.minimum(ceiling, weight - suffix_sums)
+        first = backend.where(suffix_sums % 2 == 0, lower, upper)
+
+        second = int(backend.flatnonzero(composition[:pivot] != first[:pivot])[-1])
+        composition[second] = first[second]
+        compositions.append(backend.copy(composition))
+
+    return backend.reshape(
+        backend.concatenate(compositions), (len(compositions), nqudits)
+    )
 
 
 def _x_layer(
