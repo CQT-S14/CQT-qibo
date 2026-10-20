@@ -56,6 +56,20 @@ class ControlFlowOp(Gate):
             )
         self.target_qubits = tuple(sorted(qubits))
 
+    @staticmethod
+    def _supports_backend(backend) -> bool:
+        """Checks if ``backend`` has validated native control-flow support."""
+        return backend.name == "numpy" or (
+            backend.name == "qibojit" and backend.platform == "numba"
+        )
+
+    @staticmethod
+    def _backend_label(backend) -> str:
+        """Returns an unambiguous backend/platform name for error messages."""
+        if backend.platform is None:
+            return backend.name
+        return f"{backend.name}-{backend.platform}"
+
     @property
     def gates(self) -> list[Gate]:
         """All direct child gates, without descending into nested control flow."""
@@ -162,13 +176,13 @@ class ControlFlowOp(Gate):
         )
 
     def apply(self, backend, state, nqubits):
-        """Selects and applies one branch using live NumPy measurement outcomes."""
-        if backend.name != "numpy":
+        """Selects and applies one branch using live measurement outcomes."""
+        if not self._supports_backend(backend):
             raise_error(
                 NotImplementedError,
                 "Native Qibo execution of classical control flow currently supports "
-                + "only the NumPy backend, but received "
-                + f"{backend.name!r}.",
+                + "only NumPy and qibojit-numba, but received "
+                + f"{self._backend_label(backend)!r}.",
             )
 
         classical_state = [(result, _latest_outcome(result)) for result in self.results]

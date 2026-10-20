@@ -2759,12 +2759,12 @@ class Backend:
         if not operations:
             return False
 
-        if self.name != "numpy":
+        if not gates.ControlFlowOp._supports_backend(self):
             raise_error(
                 NotImplementedError,
                 "Native Qibo execution of classical control flow currently supports "
-                + "only the NumPy backend, but received "
-                + f"{self.name!r}.",
+                + "only NumPy and qibojit-numba, but received "
+                + f"{gates.ControlFlowOp._backend_label(self)!r}.",
             )
         if circuit.accelerators:
             raise_error(

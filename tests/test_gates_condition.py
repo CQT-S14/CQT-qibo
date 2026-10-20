@@ -3,6 +3,7 @@
 import copy
 import json
 import pickle
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -220,13 +221,14 @@ def test_switch_case_validation(cases, error, match):
         gates.Switch(result, cases, default_do=[])
 
 
-def test_circuit_integration_and_numpy_native_execution():
+def test_circuit_integration_and_native_execution(backend):
     circuit, _ = feed_forward_circuit()
     operation = circuit.queue[2]
     assert circuit.has_collapse
     assert isinstance(operation, gates.ControlFlowOp)
 
-    set_backend("numpy")
+    backend_kwargs = {} if backend.platform is None else {"platform": backend.platform}
+    set_backend(backend.name, **backend_kwargs)
     get_backend().set_seed(123)
     result = circuit(nshots=100)
     frequencies = result.frequencies(binary=True)
@@ -244,7 +246,7 @@ def test_circuit_integration_and_numpy_native_execution():
     "prepare_one, expected",
     [(False, [0, 0]), (True, [1, 1])],
 )
-def test_numpy_ifelse_deterministic_branches(prepare_one, expected):
+def test_native_ifelse_deterministic_branches(backend, prepare_one, expected):
     circuit = Circuit(2)
     if prepare_one:
         circuit.add(gates.X(0))
@@ -258,11 +260,11 @@ def test_numpy_ifelse_deterministic_branches(prepare_one, expected):
     )
     circuit.add(gates.M(0, 1))
 
-    samples = NumpyBackend().execute_circuit(circuit, nshots=10).samples()
+    samples = backend.execute_circuit(circuit, nshots=10).samples()
     np.testing.assert_array_equal(samples, np.tile(expected, (10, 1)))
 
 
-def test_numpy_switch_and_nested_control_flow():
+def test_native_switch_and_nested_control_flow(backend):
     circuit = Circuit(3)
     circuit.add(gates.X(0))
     first = circuit.add(gates.M(0, collapse=True))
@@ -279,11 +281,11 @@ def test_numpy_switch_and_nested_control_flow():
     )
     circuit.add(gates.M(0, 1, 2))
 
-    samples = NumpyBackend().execute_circuit(circuit, nshots=10).samples()
+    samples = backend.execute_circuit(circuit, nshots=10).samples()
     np.testing.assert_array_equal(samples, np.tile([1, 0, 1], (10, 1)))
 
 
-def test_numpy_control_flow_uses_current_execution_outcome():
+def test_native_control_flow_uses_current_execution_outcome(backend):
     circuit = Circuit(2)
     result = circuit.add(gates.M(0, collapse=True))
     circuit.add(
@@ -294,8 +296,6 @@ def test_numpy_control_flow_uses_current_execution_outcome():
         )
     )
     circuit.add(gates.M(0, 1))
-    backend = NumpyBackend()
-
     state_one = np.zeros(4, dtype=complex)
     state_one[2] = 1
     first = backend.execute_circuit(circuit, initial_state=state_one, nshots=1)
@@ -307,7 +307,7 @@ def test_numpy_control_flow_uses_current_execution_outcome():
     np.testing.assert_array_equal(second.samples()[0], [0, 0])
 
 
-def test_numpy_control_flow_density_matrix():
+def test_native_control_flow_density_matrix(backend):
     circuit = Circuit(2, density_matrix=True)
     circuit.add(gates.X(0))
     result = circuit.add(gates.M(0, collapse=True))
@@ -319,17 +319,30 @@ def test_numpy_control_flow_density_matrix():
         )
     )
 
-    final_state = NumpyBackend().execute_circuit(circuit, nshots=5)
+    final_state = backend.execute_circuit(circuit, nshots=5)
     np.testing.assert_allclose(final_state.probabilities(), [0, 0, 0, 1])
 
 
-def test_numpy_control_flow_requires_prior_measurement():
+def test_native_control_flow_requires_prior_measurement(backend):
     external = Circuit(1).add(gates.M(0, collapse=True))
     circuit = Circuit(1)
     circuit.add(gates.IfElse(external.is_one(), then_do=gates.X(0)))
 
     with pytest.raises(ValueError, match="not performed before"):
-        NumpyBackend().execute_circuit(circuit, nshots=1)
+        backend.execute_circuit(circuit, nshots=1)
+
+
+@pytest.mark.parametrize("platform", ["cupy", "cuquantum"])
+def test_qibojit_gpu_control_flow_is_explicitly_unsupported(platform):
+    result = Circuit(1).add(gates.M(0, collapse=True))
+    operation = gates.IfElse(result.is_one(), then_do=gates.X(0))
+    gpu_backend = SimpleNamespace(name="qibojit", platform=platform)
+
+    with pytest.raises(
+        NotImplementedError,
+        match=f"only NumPy and qibojit-numba.*qibojit-{platform}",
+    ):
+        operation.apply(gpu_backend, state=None, nqubits=1)
 
 
 def test_control_flow_compilation_fails_loudly():

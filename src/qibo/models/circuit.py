@@ -1159,12 +1159,12 @@ class Circuit:
 
         backend = _Global.backend()
         if any(isinstance(gate, gates.ControlFlowOp) for gate in self.queue):
-            if backend.name != "numpy":
+            if not gates.ControlFlowOp._supports_backend(backend):
                 raise_error(
                     NotImplementedError,
                     "Native Qibo execution of classical control flow currently "
-                    + "supports only the NumPy backend, but received "
-                    + f"{backend.name!r}.",
+                    + "supports only NumPy and qibojit-numba, but received "
+                    + f"{gates.ControlFlowOp._backend_label(backend)!r}.",
                 )
             if self.accelerators:  # pragma: no cover
                 raise_error(

@@ -9,9 +9,10 @@ measurement outcomes. The public API has two operations:
 `gates.IfChain` is a fluent builder for `if`/`elif`/`else`; it lowers to nested
 `IfElse` operations, so it does not introduce a third control-flow node.
 
-> Native execution is available with Qibo's NumPy backend. Other backends,
-> compiled circuits, and distributed execution fail explicitly until they gain
-> dedicated support. Circuits can also be exported with `Circuit.to_qasm3()`.
+> Native execution is available with Qibo's NumPy backend and qibojit's Numba
+> platform. GPU platforms, compiled circuits, and distributed execution are
+> outside the supported claim and fail explicitly. Circuits can also be
+> exported with `Circuit.to_qasm3()`.
 
 ## Measurement expressions
 
@@ -159,11 +160,13 @@ operation = (
 )
 ```
 
-## Native NumPy execution
+## Native execution
 
-Select the NumPy backend and execute the circuit normally. During every shot,
-Qibo collapses the referenced measurement, evaluates the condition using that
-shot's outcome, applies exactly one branch, and continues with the circuit:
+Select a supported backend and execute the circuit normally. During every
+shot, Qibo collapses the referenced measurement, evaluates the condition using
+that shot's outcome, applies exactly one branch, and continues with the
+circuit. This example deliberately selects NumPy so it runs without qibojit or
+GPU dependencies:
 
 ```python
 from qibo import Circuit, gates, set_backend
@@ -186,6 +189,13 @@ result = circuit(nshots=1000)
 print(result.frequencies(binary=True))  # only 00 and 11
 ```
 
+To execute the same circuit with qibojit on CPU, select its Numba platform:
+
+```python
+set_backend("qibojit", platform="numba")
+result = circuit(nshots=1000)
+```
+
 Every measurement referenced by an `IfElse` or `Switch`, including nested
 operations, must occur earlier in the same circuit. Reusing a circuit is safe:
 measurement outcomes are cleared at the beginning of each execution.
@@ -193,6 +203,30 @@ measurement outcomes are cleared at the beginning of each execution.
 For state-vector execution with several shots, add a final non-collapsing
 measurement as above so Qibo can return shot outcomes. To retrieve an averaged
 final quantum state after stochastic control flow, use a density-matrix circuit.
+
+### Native support boundary
+
+The support claim is intentionally platform-specific. A backend provider name
+alone is not enough: qibojit's CPU and GPU platforms follow different execution
+paths.
+
+| Backend/platform | Native conditional status |
+| --- | --- |
+| `numpy` | Supported and covered by deterministic, stochastic, nested, repeated-execution, and density-matrix tests. |
+| `qibojit`, `platform="numba"` | Supported on CPU and covered by the same test matrix as NumPy. |
+| `qibojit`, `platform="cupy"` | **Not tested and explicitly unsupported.** Qibo rejects native conditional execution before simulation. |
+| `qibojit`, `platform="cuquantum"` | **Not tested and explicitly unsupported.** Qibo rejects native conditional execution before simulation. |
+| Distributed/multi-GPU execution | **Not tested and explicitly unsupported.** Circuits with accelerators are rejected. |
+| Compiled execution | Explicitly unsupported for all backends. |
+
+In particular, support for `qibojit-numba` must not be interpreted as support
+for `qibojit-cupy` or `qibojit-cuquantum`. Neither GPU platform was available
+in the validation environment. Before either can enter the supported set, it
+needs GPU-backed validation of collapse sampling, transfer and interpretation
+of live measurement outcomes, branch-gate application, repeated shots, nested
+control flow, density matrices, and circuit reuse. The current backend guard
+keeps these unverified paths outside the claim and produces an error naming the
+received platform.
 
 ## Inspecting branch selection
 
@@ -240,5 +274,24 @@ qasm = circuit.to_qasm3(qiskit_compatible=False)
 `default`, including when the branch is empty. A measurement referenced by a
 control-flow operation must occur earlier in the same circuit.
 
-See the complete runnable template in
-`examples/conditional_measurement_example/conditional_operations_api.py`.
+## Runnable examples
+
+From the repository root, run the focused native NumPy examples with:
+
+```shell
+.venv/bin/python examples/conditional_measurement_example/native_conditional_execution.py
+```
+
+That script executes and checks a stochastic `IfElse`, a deterministic
+`IfElse`, a grouped `Switch`, and an `IfChain` end to end. Each example is a
+separate function, so it is also convenient to copy or modify one case at a
+time.
+
+The broader API and OpenQASM 3 template is:
+
+```shell
+.venv/bin/python examples/conditional_measurement_example/conditional_operations_api.py
+```
+
+It demonstrates expression helpers, all three construction styles, direct
+branch inspection, native NumPy execution, and QASM 3 export.
