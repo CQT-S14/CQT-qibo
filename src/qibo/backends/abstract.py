@@ -38,6 +38,10 @@ class Backend:
         self.oom_error = MemoryError
         self.platform = None
         self.supports_multigpu = False
+        # Whole-circuit execution capabilities for external hardware adapters.
+        # These do not enable native state-vector evaluation of control-flow gates.
+        self.supports_circuit_control_flow = False
+        self.handles_circuit_transpilation = False
         self.tensor_types = ()
         self.versions = {"qibo": __version__}
 

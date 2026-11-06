@@ -84,3 +84,23 @@ We provide the following hardware control backends for Qibo:
 * `qibo-cloud-backends <https://qibo.science/qibo-cloud-backends/stable/>`_:
   provides access to cloud quantum hardware. This module is compatible with labs
   using Qibo for control and calibration and external vendors.
+
+External circuit execution in this fork
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+External backends can opt into two independent circuit-level capabilities,
+both disabled by default in ``Backend.__init__``:
+
+* ``supports_circuit_control_flow`` admits ``IfElse``/``Switch`` circuits to the
+  backend's whole-circuit execution method. It does not enable native
+  state-vector evaluation of individual conditional gates; the existing NumPy
+  and qibojit-numba checks for that remain unchanged.
+* ``handles_circuit_transpilation`` passes the original circuit directly to
+  ``backend.execute_circuit``. Neither default nor explicitly selected global
+  Qibo transpiler passes are called. The backend owns placement, gate
+  translation and validation. Previously compiled simulator executors cannot
+  run while such a backend is selected; use an uncompiled circuit.
+
+The dedicated ``qm-backend`` adapter uses both capabilities to preserve its
+Qibo-to-OpenQASM-3-to-Qiskit pipeline and user-supplied physical placement.
+Other backends retain their existing execution/transpilation behavior.

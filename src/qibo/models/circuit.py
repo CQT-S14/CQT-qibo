@@ -1152,18 +1152,27 @@ class Circuit:
             Either a ``qibo.result.QuantumState``, ``qibo.result.MeasurementOutcomes``
             or ``qibo.result.CircuitResult`` depending on the circuit's configuration.
         """
+        backend = _Global.backend()
         if self.compiled:
+            if getattr(backend, "handles_circuit_transpilation", False):
+                raise_error(
+                    NotImplementedError,
+                    "Compiled simulator executors cannot be used with a backend "
+                    + "that handles circuit transpilation; use an uncompiled circuit.",
+                )
             state = self.compiled.executor(initial_state, nshots)
             self._final_state = self.compiled.result(state, nshots)
             return self._final_state
 
-        backend = _Global.backend()
         if any(isinstance(gate, gates.ControlFlowOp) for gate in self.queue):
-            if not gates.ControlFlowOp._supports_backend(backend):
+            if not (
+                gates.ControlFlowOp._supports_backend(backend)
+                or getattr(backend, "supports_circuit_control_flow", False)
+            ):
                 raise_error(
                     NotImplementedError,
-                    "Native Qibo execution of classical control flow currently "
-                    + "supports only NumPy and qibojit-numba, but received "
+                    "Classical control flow requires a backend with circuit-level "
+                    + "support or native NumPy/qibojit-numba execution, but received "
                     + f"{gates.ControlFlowOp._backend_label(backend)!r}.",
                 )
             if self.accelerators:  # pragma: no cover
@@ -1172,8 +1181,13 @@ class Circuit:
                     "Native Qibo execution of classical control flow is not "
                     + "implemented for distributed circuits.",
                 )
-        transpiler = _Global.transpiler()
-        transpiled_circuit, _ = transpiler(self)
+        if getattr(backend, "handles_circuit_transpilation", False):
+            # Preserve the complete original circuit for the backend's own pipeline.
+            # This bypasses both the default and any explicitly selected global passes.
+            transpiled_circuit = self
+        else:
+            transpiler = _Global.transpiler()
+            transpiled_circuit, _ = transpiler(self)
 
         if self.accelerators:  # pragma: no cover
             return backend.execute_distributed_circuit(
